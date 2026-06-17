@@ -4,6 +4,13 @@ import { COLLECTION } from './constants';
 
 type Metric = 'estimatedValue' | 'boqValue';
 
+// Each metric maps to a document type + the numeric payload field to aggregate.
+// 'boqValue' = the BOQ amount (cost) on boq docs, which now carry the project name.
+const METRIC_CONFIG: Record<Metric, { docType: 'project' | 'boq'; field: string }> = {
+  estimatedValue: { docType: 'project', field: 'estimatedValue' },
+  boqValue: { docType: 'boq', field: 'cost' },
+};
+
 export interface AnalyticsQuery {
   customerId: string;
   metric?: Metric;          // money field to aggregate (default estimatedValue)
@@ -11,6 +18,9 @@ export interface AnalyticsQuery {
   teamMember?: string;      // filter to projects where this person is on the team
   role?: string;            // optional role to match alongside teamMember
   groupBy?: 'stage' | 'city' | 'owner';
+  city?: string;            // optional city to filter by
+  stage?: string;           // optional stage to filter by
+  owner?: string;           // optional owner to filter by
 }
 
 /**
@@ -26,11 +36,40 @@ export class ProjectAnalyticsService {
     return Number.isFinite(n) ? n : 0;
   }
 
-  private async loadProjects(customerId: string) {
+  private formatNumber(val: number, raw: any): string {
+    if (typeof raw === 'string' && /^\d+$/.test(raw)) {
+      try {
+        const bigintVal = BigInt(raw);
+        if (raw.length > 21) {
+          const str = bigintVal.toString();
+          return `${str[0]}.${str.slice(1, 3)}e+${str.length - 1}`;
+        }
+        return bigintVal.toLocaleString('en-IN');
+      } catch {
+        // Fall back
+      }
+    }
+    if (val > Number.MAX_SAFE_INTEGER || val < -Number.MAX_SAFE_INTEGER) {
+      return val.toExponential(2);
+    }
+    return val.toLocaleString('en-IN');
+  }
+
+  // Load one payload per document (deduped across chunks) for a given docType.
+  private async loadDocs(customerId: string, docType: 'project' | 'boq') {
     const points = await this.qdrantService.scrollAll(COLLECTION, {
-      must: [{ key: 'customerId', match: { value: customerId } }],
+      must: [
+        { key: 'customerId', match: { value: customerId } },
+        { key: 'docType', match: { value: docType } },
+      ],
     });
-    return points.map((p) => p.payload || {});
+    const byDoc = new Map<string, any>();
+    for (const pt of points) {
+      const p = pt.payload || {};
+      const key = p.original_id || p.boqId || p.projectId;
+      if (key && !byDoc.has(key)) byDoc.set(key, p);
+    }
+    return [...byDoc.values()];
   }
 
   private matchesTeam(project: any, member: string, role?: string): boolean {
@@ -45,24 +84,52 @@ export class ProjectAnalyticsService {
 
   async analyze(query: AnalyticsQuery) {
     const metric: Metric = query.metric || 'estimatedValue';
+    const { docType, field } = METRIC_CONFIG[metric];
     const topN = query.topN ?? 5;
 
-    let projects = await this.loadProjects(query.customerId);
+    let docs = await this.loadDocs(query.customerId, docType);
 
-    if (query.teamMember) {
-      projects = projects.filter((p) => this.matchesTeam(p, query.teamMember!, query.role));
+    // Filter by city
+    if (query.city) {
+      const c = query.city.trim().toLowerCase();
+      docs = docs.filter((p) => (p.city || '').trim().toLowerCase() === c);
     }
 
-    const rows = projects.map((p) => ({
-      projectCode: p.projectCode,
-      companyName: (p.companyName || '').trim(),
-      city: p.city,
-      stage: p.stage,
-      owner: p.owner,
-      value: this.num(p[metric]),
-    }));
+    // Filter by stage
+    if (query.stage) {
+      const s = query.stage.trim().toLowerCase();
+      docs = docs.filter((p) => (p.stage || '').trim().toLowerCase() === s);
+    }
 
-    const total = rows.reduce((sum, r) => sum + r.value, 0);
+    // Filter by owner
+    if (query.owner) {
+      const o = query.owner.trim().toLowerCase();
+      docs = docs.filter((p) => (p.owner || '').trim().toLowerCase() === o);
+    }
+
+    // Team filtering only applies to project docs (BOQ docs have no team).
+    if (query.teamMember && docType === 'project') {
+      docs = docs.filter((p) => this.matchesTeam(p, query.teamMember!, query.role));
+    }
+
+    const rows = docs.map((p) => {
+      const val = this.num(p[field]);
+      return {
+        projectCode: p.projectCode,
+        companyName: (p.companyName || '').trim(),
+        projectName: p.projectName || null,
+        projectId: p.projectId,
+        boqCode: docType === 'boq' ? p.boqCode : undefined,
+        status: docType === 'boq' ? p.status : undefined,
+        city: p.city,
+        stage: p.stage,
+        owner: p.owner,
+        value: val,
+        formattedValue: this.formatNumber(val, p[field]),
+      };
+    });
+
+    const totalVal = rows.reduce((sum, r) => sum + r.value, 0);
     const top = [...rows].sort((a, b) => b.value - a.value).slice(0, topN);
 
     let breakdown: Record<string, { count: number; total: number }> | undefined;
@@ -78,10 +145,18 @@ export class ProjectAnalyticsService {
 
     return {
       metric,
-      filter: query.teamMember ? { teamMember: query.teamMember, role: query.role || 'any' } : null,
+      filter: {
+        teamMember: query.teamMember || null,
+        role: query.role || null,
+        city: query.city || null,
+        stage: query.stage || null,
+        owner: query.owner || null,
+      },
       count: rows.length,
-      total,
-      average: rows.length ? total / rows.length : 0,
+      total: totalVal,
+      formattedTotal: this.formatNumber(totalVal, null),
+      average: rows.length ? totalVal / rows.length : 0,
+      formattedAverage: this.formatNumber(rows.length ? totalVal / rows.length : 0, null),
       top,
       breakdown,
     };

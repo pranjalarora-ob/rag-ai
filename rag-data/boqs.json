@@ -1,0 +1,35 @@
+[
+  {
+    "id": "boq-101",
+    "project_id": "proj-abc",
+    "name": "Phase 1 Interior",
+    "code": "BOQ-INT-01",
+    "type": "Interior",
+    "status": "Approved",
+    "stage": "Final",
+    "area": "1500 sqft",
+    "height": "10ft",
+    "cost": 500000.0,
+    "discountedCost": 450000.0,
+    "overallDiscount": 50000.0,
+    "salesCost": 480000.0,
+    "salesDiscountedCost": 430000.0,
+    "approveRemarks": "Looks good to proceed."
+  },
+  {
+    "id": "boq-102",
+    "project_id": "proj-xyz",
+    "name": "MEP Works",
+    "code": "BOQ-MEP-02",
+    "type": "MEP",
+    "status": "Draft",
+    "stage": "Initial",
+    "area": "2500 sqft",
+    "height": "12ft",
+    "cost": 1200000.0,
+    "discountedCost": 1200000.0,
+    "overallDiscount": 0.0,
+    "salesCost": 1200000.0,
+    "salesDiscountedCost": 1200000.0
+  }
+]
