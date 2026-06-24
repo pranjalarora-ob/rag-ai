@@ -19,7 +19,7 @@ SELECT
   t.account_id               AS account_id,
   t.code, t.name, t.company_name, t.nature_of_business,
   t.city, t.state, t.zone, t.area_sft,
-  t.stage, t.sub_stage, t.priority, t.lead_type,
+  t.type, t.stage, t.sub_stage, t.priority, t.lead_type,
   t.lead_status, t.project_status, t.owner, t.scope, t.channel,
   t.estimated_value, t.current_project_value, t.closure_value,
   t.customer_info,
@@ -104,14 +104,23 @@ export const projectSource: SourceDefinition = {
       text: lines.join('\n'),
       metadata: {
         docType: 'project',
+        type: row.type ? String(row.type).toLowerCase() : null, // DB type LEAD|PROJECT -> "lead"|"project"
         projectId: row.id,
         accountId: row.account_id,
         customerId: row.account_id, // keeps the existing chat/analytics customerId filter working
         projectCode: row.code,
+        projectName: row.name,
         companyName: row.company_name,
+        customerInfo: {
+          name: cust.name || cust.customerName || null,
+          email: cust.emailId || cust.email || null,
+          mobile: cust.mobileNumber || cust.mobile_number || null,
+        },
         city: row.city,
         state: row.state,
         zone: row.zone,
+        areaSft: num(row.area_sft),
+        channel: row.channel,
         stage: row.stage,
         subStage: row.sub_stage,
         leadStatus: row.lead_status,

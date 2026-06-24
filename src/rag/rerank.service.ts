@@ -42,7 +42,6 @@ export class RerankService {
           },
         },
       );
-
       const results = response.data?.results || [];
       // Sort the results and map back to the original documents using their indices
       const rerankedDocs = results
