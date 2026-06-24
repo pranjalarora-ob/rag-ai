@@ -10,7 +10,7 @@ export class QdrantService {
   private QDRANT_URL: string;
   private QDRANT_API_KEY: string;
   private client: QdrantClient;
-  EMBEDDING_DIM = 3072; // gemini-embedding-001
+  EMBEDDING_DIM = 1536; // openai/text-embedding-3-small
 
   constructor(private readonly configService: ConfigService) {
     this.QDRANT_URL = this.configService.get('QDRANT_URL') || 'http://localhost:6333';
@@ -103,17 +103,31 @@ export class QdrantService {
         offset = res.next_page_offset;
       } while (offset !== null && offset !== undefined);
     } catch (error: any) {
+      console.error('Qdrant scrollAll error details:', {
+        status: error?.status,
+        message: error?.message,
+        data: error?.data,
+      });
       if (error?.status === 404) return [];
       throw error;
     }
     return points;
   }
 
-  addIndex(collection: string, addSchemaIndexDto: AddSchemaIndexDto) {
-    return this.client.createPayloadIndex(collection, {
-      field_name: addSchemaIndexDto.field,
-      field_schema: addSchemaIndexDto.schema,
-    });
+  async addIndex(collection: string, addSchemaIndexDto: AddSchemaIndexDto) {
+    try {
+      return await this.client.createPayloadIndex(collection, {
+        field_name: addSchemaIndexDto.field,
+        field_schema: addSchemaIndexDto.schema,
+      });
+    } catch (error: any) {
+      console.error('Qdrant addIndex error details:', {
+        status: error?.status,
+        message: error?.message,
+        data: error?.data,
+      });
+      throw error;
+    }
   }
 
   clearCollection(collection: string) {

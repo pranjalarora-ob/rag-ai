@@ -5,23 +5,21 @@ import { Response } from 'express';
 import { ChatCompletionRequestMessage } from './dto/openai.dto';
 
 /**
- * Generation goes through OpenRouter (OpenAI-compatible). Embeddings go through
- * Google Gemini (gemini-embedding-001, 3072 dims) — its quota is separate from chat.
+ * Generation and Embeddings go through OpenRouter (OpenAI-compatible).
  */
 @Injectable()
 export class OpenaiService {
-  private readonly GEMINI_API_KEY: string;
   private readonly OPENROUTER_API_KEY: string;
+  private readonly OPENROUTER_MODEL: string;
+  private readonly EMBEDDING_MODEL: string;
 
-  private readonly GEMINI_EMBEDDING_URL =
-    'https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:embedContent';
+  private readonly OPENROUTER_EMBEDDINGS_URL = 'https://openrouter.ai/api/v1/embeddings';
   private readonly OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
-  // Swap the model here — any OpenRouter chat model with tool-calling works (e.g. google/gemini-2.5-flash).
-  private readonly OPENROUTER_MODEL = 'openai/gpt-4o-mini';
 
   constructor(private readonly configService: ConfigService) {
-    this.GEMINI_API_KEY = this.configService.get('GEMINI_API_KEY') || '';
     this.OPENROUTER_API_KEY = this.configService.get('OPEN_ROUTER_API_KEY') || '';
+    this.OPENROUTER_MODEL = this.configService.get('OPEN_ROUTER_MODEL') || 'openai/gpt-4o-mini';
+    this.EMBEDDING_MODEL = this.configService.get('EMBEDDING_MODEL') || 'openai/text-embedding-3-small';
   }
 
   private get openRouterHeaders() {
@@ -31,22 +29,53 @@ export class OpenaiService {
     };
   }
 
-  // ---- Embeddings (Gemini) ----
-  async generateGeminiEmbedding(input: string): Promise<number[]> {
+  // ---- Embeddings (OpenRouter/OpenAI) ----
+  async generateEmbedding(input: string): Promise<number[]> {
     try {
-      const response = await axios.post(`${this.GEMINI_EMBEDDING_URL}?key=${this.GEMINI_API_KEY}`, {
-        content: { parts: [{ text: input }] },
-        taskType: 'RETRIEVAL_DOCUMENT',
-      });
-      const embedding = response.data.embedding?.values;
+      const response = await axios.post(
+        this.OPENROUTER_EMBEDDINGS_URL,
+        {
+          model: this.EMBEDDING_MODEL,
+          input,
+        },
+        {
+          headers: this.openRouterHeaders,
+        },
+      );
+      const embedding = response.data.data?.[0]?.embedding;
       if (!embedding || !Array.isArray(embedding)) {
-        throw new Error('No embedding values returned from Gemini');
+        throw new Error('No embedding values returned from OpenRouter');
       }
       return embedding;
     } catch (error: any) {
-      console.error('Gemini Embedding Error:', error?.response?.data || error?.message);
+      console.error('OpenRouter Embedding Error:', error?.response?.data || error?.message);
       throw new InternalServerErrorException(`Failed to generate embedding: ${error?.message}`);
     }
+  }
+
+  // ---- Batched embeddings — one HTTP call per `batchSize` texts (used by ingestion) ----
+  async generateEmbeddings(inputs: string[], batchSize = 96): Promise<number[][]> {
+    const out: number[][] = [];
+    for (let i = 0; i < inputs.length; i += batchSize) {
+      const batch = inputs.slice(i, i + batchSize);
+      try {
+        const response = await axios.post(
+          this.OPENROUTER_EMBEDDINGS_URL,
+          { model: this.EMBEDDING_MODEL, input: batch },
+          { headers: this.openRouterHeaders },
+        );
+        const data = response.data?.data;
+        if (!Array.isArray(data) || data.length !== batch.length) {
+          throw new Error('Embedding count mismatch from provider');
+        }
+        // The API may return items out of order — sort by `index` before collecting.
+        [...data].sort((a, b) => a.index - b.index).forEach((d) => out.push(d.embedding));
+      } catch (error: any) {
+        console.error('OpenRouter Batch Embedding Error:', error?.response?.data || error?.message);
+        throw new InternalServerErrorException(`Failed to generate embeddings: ${error?.message}`);
+      }
+    }
+    return out;
   }
 
   // ---- Streaming chat (OpenRouter) ----

@@ -2,6 +2,8 @@ import { Injectable } from '@nestjs/common';
 import { OpenaiService } from './openai.service';
 import { QdrantService } from './qdrant.service';
 import { ProjectAnalyticsService } from './project-analytics.service';
+import { ClaudeService } from './claude.service';
+import { RerankService } from './rerank.service';
 import { SYSTEM_PROMPT, COLLECTION } from './constants';
 
 const MAX_STEPS = 5; // safety cap on the tool→evaluate→tool loop
@@ -23,7 +25,9 @@ export class PlannerService {
     private readonly openaiService: OpenaiService,
     private readonly qdrantService: QdrantService,
     private readonly projectAnalyticsService: ProjectAnalyticsService,
-  ) {}
+    private readonly claudeService: ClaudeService,
+    private readonly rerankService: RerankService,
+  ) { }
 
   private readonly tools = [
     {
@@ -55,6 +59,9 @@ export class PlannerService {
             teamMember: { type: 'string', description: 'Filter to projects where this person is on the team.' },
             role: { type: 'string', description: 'Role to match with teamMember, e.g. "Design Manager".' },
             groupBy: { type: 'string', enum: ['stage', 'city', 'owner'] },
+            city: { type: 'string', description: 'Filter to projects in this city, e.g., "Gurugram".' },
+            stage: { type: 'string', description: 'Filter to projects in this stage.' },
+            owner: { type: 'string', description: 'Filter to projects owned by this person.' },
           },
         },
       },
@@ -87,7 +94,9 @@ Rules:
     const trace: PlannerResult['trace'] = [];
 
     for (let step = 1; step <= MAX_STEPS; step++) {
-      const assistant = await this.openaiService.openRouterToolTurn(messages, this.tools);
+      const assistant = this.claudeService.isConfigured
+        ? await this.claudeService.claudeToolTurn(messages, this.tools)
+        : await this.openaiService.openRouterToolTurn(messages, this.tools);
       const toolCalls = assistant?.tool_calls;
 
       if (!toolCalls || toolCalls.length === 0) {
@@ -115,16 +124,17 @@ Rules:
   private async executeTool(name: string, args: any, customerId: string) {
     try {
       if (name === 'searchProjects') {
-        const embedding = await this.openaiService.generateGeminiEmbedding(args.query || '');
+        const embedding = await this.openaiService.generateEmbedding(args.query || '');
         const hits = await this.qdrantService.search(COLLECTION, {
           vector: embedding,
-          limit: 20,
+          limit: 50,
           filter: { must: [{ key: 'customerId', match: { value: customerId } }] },
         });
-        return hits
+        const rawChunks = hits
           .sort((a: any, b: any) => b.score - a.score)
-          .slice(0, 10)
           .map((h: any) => h.payload?.text as string);
+        const reranked = await this.rerankService.rerank(args.query || '', rawChunks, 10);
+        return reranked.slice(0, 10);
       }
 
       if (name === 'projectAnalytics') {
@@ -135,6 +145,9 @@ Rules:
           teamMember: args.teamMember,
           role: args.role,
           groupBy: args.groupBy,
+          city: args.city,
+          stage: args.stage,
+          owner: args.owner,
         });
       }
 

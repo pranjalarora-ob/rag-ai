@@ -6,7 +6,7 @@
 set -euo pipefail
 
 DATA_FILE="${1:-rag-data/projects.json}"
-CUSTOMER_ID="${2:-cust_123}"
+CUSTOMER_ID="${2:-cust_12345}"
 HOST="${HOST:-http://localhost:3000}"
 
 BODY=$(python3 - "$DATA_FILE" "$CUSTOMER_ID" <<'PY'
@@ -54,6 +54,8 @@ for p in projects:
         "id": p.get("projectId"),
         "text": "\n".join(lines),
         "metadata": {
+            "entityType": "project",
+            "projectId": p.get("projectId"),
             "projectCode": p.get("projectCode"),
             "companyName": p.get("companyName"),
             "city": p.get("city"),
