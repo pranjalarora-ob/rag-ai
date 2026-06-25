@@ -219,9 +219,11 @@ export class RagController {
           return;
         }
 
+        // Names-only intent ("give names", "list names", "what are the names") -> numbered list.
+        const namesOnly = /\b(names?|name list|just names?|only names?)\b/i.test(question) &&
+          !/\b(code|area|value|cost|city|stage|owner|details?|info)\b/i.test(question);
+
         const topN = this.parseTopN(question);
-        // "top N" sorts by the dimension being asked about: by area when the question is
-        // about area, otherwise by estimated value (explicit value words win).
         const sortKey =
           /\b(value|estimated|cost|budget|worth)\b/i.test(question)
             ? 'estimatedValue'
@@ -231,12 +233,16 @@ export class RagController {
         items = items.sort((a, b) => (Number(b[sortKey]) || 0) - (Number(a[sortKey]) || 0));
         if (topN) items = items.slice(0, topN);
 
-        // Deterministic list — return the table DIRECTLY, no LLM. Routing an exact list
-        // through the model truncates/reorders rows and is slow; the data is already exact.
         const sortLabel = sortKey === 'areaSft' ? 'area' : 'estimated value';
         let answer: string;
         if (!items.length) {
           answer = 'No projects match that filter.';
+        } else if (namesOnly) {
+          const header = `${totalMatched} matching ${typeLabel}:`;
+          const body = items
+            .map((pl, i) => `${i + 1}. ${pl.projectName || (pl.companyName || '').trim() || pl.projectCode}`)
+            .join('\n');
+          answer = `${header}\n\n${body}`;
         } else {
           const header = topN
             ? `Top ${items.length} ${typeLabel} (of ${totalMatched} matching) by ${sortLabel}:`
