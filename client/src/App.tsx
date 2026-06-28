@@ -124,7 +124,16 @@ function parseTableBlock(content: string): ParsedTable | null {
   }
 }
 
-function parseTableForChart(content: string): { data: ChartPoint[], yLabel: string } | null {
+interface ChartSeries {
+  key: string          // column header, e.g. "Estimated Value"
+  yLabel: string       // axis label
+  isArea: boolean
+  data: ChartPoint[]
+}
+
+// Build one chartable series per numeric column (value, area, cost…), so the user
+// can choose what to plot. Returns null if nothing is chartable.
+function parseChartSeries(content: string): ChartSeries[] | null {
   const tableLines = content.split('\n').filter(l => l.trim().startsWith('|'))
   if (tableLines.length < 3) return null
 
@@ -137,27 +146,29 @@ function parseTableForChart(content: string): { data: ChartPoint[], yLabel: stri
   const nameIdx = headers.findIndex(h => /name/i.test(h))
   if (nameIdx === -1) return null
 
-  const valueIdx = headers.findIndex(h => /value/i.test(h))
-  const areaIdx  = headers.findIndex(h => /area/i.test(h))
-  const colIdx   = valueIdx !== -1 ? valueIdx : areaIdx
-  if (colIdx === -1) return null
+  const series: ChartSeries[] = []
+  headers.forEach((h, colIdx) => {
+    if (colIdx === nameIdx) return
+    if (!/value|area|cost|budget|worth|price|amount|sqft/i.test(h)) return
+    const isArea = /area|sqft/i.test(h)
 
-  const isArea = colIdx === areaIdx && valueIdx === -1
-  const yLabel = isArea ? 'Area (sqft)' : 'Est. Value (₹ Cr)'
+    const raw_data: ChartPoint[] = dataRows
+      .map(cells => {
+        const nameRaw = (cells[nameIdx] || '').replace(/^\d{10}-/, '').slice(0, 24)
+        const raw = parseFloat((cells[colIdx] || '0').replace(/[^\d.e+\-]/g, ''))
+        if (!Number.isFinite(raw) || raw <= 0) return null
+        const value = isArea ? Math.round(raw) : Math.round(raw / 1e7 * 100) / 100
+        return { name: nameRaw, value, label: fmtNum(raw, isArea) }
+      })
+      .filter((d): d is ChartPoint => d !== null && d.value > 0)
 
-  const raw_data: ChartPoint[] = dataRows
-    .map(cells => {
-      const nameRaw = (cells[nameIdx] || '').replace(/^\d{10}-/, '').slice(0, 24)
-      const raw = parseFloat((cells[colIdx] || '0').replace(/[^\d.e+\-]/g, ''))
-      if (!Number.isFinite(raw) || raw <= 0) return null
-      const value = isArea ? Math.round(raw) : Math.round(raw / 1e7 * 100) / 100
-      return { name: nameRaw, value, label: fmtNum(raw, isArea) }
-    })
-    .filter((d): d is ChartPoint => d !== null && d.value > 0)
+    const data = removeOutliers(raw_data).slice(0, 20)
+    if (data.length >= 2) {
+      series.push({ key: h, yLabel: isArea ? 'Area (sqft)' : 'Est. Value (₹ Cr)', isArea, data })
+    }
+  })
 
-  const data = removeOutliers(raw_data).slice(0, 20)
-
-  return data.length >= 2 ? { data, yLabel } : null
+  return series.length ? series : null
 }
 
 // Drop garbage DB values that span many orders of magnitude (e.g. 6e58 alongside
@@ -188,8 +199,13 @@ function removeOutliers(points: ChartPoint[], threshold = 3): ChartPoint[] {
 
 // ── ChartView ─────────────────────────────────────────────────────────────────
 
-function ChartView({ data, yLabel }: { data: ChartPoint[], yLabel: string }) {
+function ChartView({ series }: { series: ChartSeries[] }) {
   const [type, setType] = useState<'bar' | 'hbar' | 'pie'>('hbar')
+  const [seriesIdx, setSeriesIdx] = useState(0)
+
+  const active = series[Math.min(seriesIdx, series.length - 1)]
+  const data = active.data
+  const yLabel = active.yLabel
 
   const compact = (v: number) => {
     if (v === 0) return '0'
@@ -214,7 +230,21 @@ function ChartView({ data, yLabel }: { data: ChartPoint[], yLabel: string }) {
   return (
     <div className="chart-wrapper">
       <div className="chart-controls">
-        <span className="chart-ylabel">{yLabel}</span>
+        {series.length > 1 ? (
+          <div className="chart-type-btns">
+            {series.map((s, i) => (
+              <button
+                key={s.key}
+                className={`ctype-btn ${seriesIdx === i ? 'on' : ''}`}
+                onClick={() => setSeriesIdx(i)}
+              >
+                {s.isArea ? 'Area' : s.key.replace(/estimated/i, 'Est.')}
+              </button>
+            ))}
+          </div>
+        ) : (
+          <span className="chart-ylabel">{yLabel}</span>
+        )}
         <div className="chart-type-btns">
           <button className={`ctype-btn ${type === 'hbar' ? 'on' : ''}`} onClick={() => setType('hbar')}>H-Bar</button>
           <button className={`ctype-btn ${type === 'bar' ? 'on' : ''}`} onClick={() => setType('bar')}>Bar</button>
@@ -462,7 +492,7 @@ function MessageBubble({ msg }: { msg: Message }) {
 
   const chartData = useMemo(() => {
     if (msg.role !== 'assistant' || msg.loading) return null
-    return parseTableForChart(msg.content)
+    return parseChartSeries(msg.content)
   }, [msg.content, msg.role, msg.loading])
 
   const table = useMemo(() => {
@@ -495,7 +525,7 @@ function MessageBubble({ msg }: { msg: Message }) {
               <div className="md"><ReactMarkdown remarkPlugins={[remarkGfm]}>{table.before}</ReactMarkdown></div>
             )}
             {showChart && chartData
-              ? <ChartView data={chartData.data} yLabel={chartData.yLabel} />
+              ? <ChartView series={chartData} />
               : <DataTable headers={table.headers} rows={table.rows} />}
             {table.after && (
               <div className="md" style={{ marginTop: 10 }}><ReactMarkdown remarkPlugins={[remarkGfm]}>{table.after}</ReactMarkdown></div>

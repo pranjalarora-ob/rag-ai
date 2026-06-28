@@ -104,11 +104,25 @@ export class RagController {
       if (this.guardrailService.isPolicyViolation(body.question)) {
         throw new BadRequestException('Query violates company policy.');
       }
+
+      // Semantic cache: skip the full LLM+tool loop if a near-identical question
+      // was already answered for this customer (cosine similarity >= 0.92).
+      const cache = await this.semanticCache.check(body.question, body.customerId);
+      if (cache?.answer) {
+        res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.send(cache.answer);
+        return;
+      }
+
       await this.plannerService.runStream({
         question: body.question,
         customerId: body.customerId,
         history: body.history,
         res,
+        onAnswer: (answer: string) => {
+          this.semanticCache.save(body.question, cache?.embedding ?? [], answer, body.customerId).catch(() => {});
+        },
       });
     } catch (err) {
       console.error(err);

@@ -12,9 +12,27 @@ const MAX_STEPS = 5; // safety cap on the tool→evaluate→tool loop
 // the UI can turn into charts. The chart parser needs a "Name" column plus a
 // "Value"/"Area" column, so the columns below must stay in sync with it.
 const TABLE_FORMAT_INSTRUCTION = `
-When the answer lists multiple projects/records, format them as a GitHub markdown table with these exact columns:
+=== CRITICAL OUTPUT RULES — MUST FOLLOW EXACTLY ===
+
+RULE 1 — NEVER say you cannot draw a chart. The UI draws charts FOR you from tables.
+RULE 2 — NEVER use bullet points or numbered lists when showing multiple projects.
+RULE 3 — ALWAYS use a markdown table when showing 2+ projects. Exact columns:
+  | # | Code | Name | City | Area (sqft) | Estimated Value |
+  Use RAW integers in Area and Estimated Value (NO commas, NO "Cr"/"L" suffix, NO units).
+
+RULE 4 — When the user asks for a "chart", "graph", "pie", "bar", "comparison", or "visualize":
+  → Call projectAnalytics with metric="area" (or relevant metric) and topN=50
+  → Return the results as the markdown table above
+  → Do NOT say anything like "I am unable to provide a chart"
+
+Example of CORRECT response to "show top 5 projects by area":
 | # | Code | Name | City | Area (sqft) | Estimated Value |
-Use one row per record and keep raw numbers (no "Cr"/"L" suffixes) in the value/area cells so they can be charted. For single facts, counts, or short explanations, answer in plain prose instead.`;
+|---|------|------|------|-------------|-----------------|
+| 1 | P001 | Alpha Tower | Delhi | 85000 | 50000000 |
+| 2 | P002 | Beta Mall | Mumbai | 72000 | 43000000 |
+
+RULE 5 — Only use plain prose (no table) for single facts, yes/no, or counts with no row data.
+=== END CRITICAL RULES ===`;
 
 export interface PlannerResult {
   answer: string;
@@ -61,17 +79,29 @@ export class PlannerService {
         parameters: {
           type: 'object',
           properties: {
-            metric: { type: 'string', enum: ['estimatedValue', 'boqValue'] },
-            topN: { type: 'number' },
+            metric: { type: 'string', enum: ['estimatedValue', 'boqValue', 'area'], description: 'What to rank/total/chart by. Use "area" for area-based questions ("compare their area", "largest by area").' },
+            topN: { type: 'number', description: 'Return only the top N by value/area. Set to 50 when asked to chart/compare all results or when a previous list was longer than 5.' },
             teamMember: { type: 'string', description: 'Filter to projects where this person is on the team.' },
             role: { type: 'string', description: 'Role to match with teamMember, e.g. "Design Manager".' },
-            groupBy: { type: 'string', enum: ['stage', 'city', 'owner'] },
-            city: { type: 'string', description: 'Filter to projects in this city, e.g., "Gurugram".' },
-            zone: { type: 'string', description: 'Filter to projects in this zone, e.g., "North".' },
-            stage: { type: 'string', description: 'Filter to projects in this stage.' },
-            owner: { type: 'string', description: 'Filter to projects owned by this person/team.' },
-            minValue: { type: 'number', description: 'Filter to projects with estimatedValue >= this number (in rupees).' },
-            maxValue: { type: 'number', description: 'Filter to projects with estimatedValue <= this number (in rupees).' },
+            groupBy: {
+              type: 'string',
+              enum: ['stage', 'subStage', 'city', 'state', 'zone', 'owner', 'channel', 'projectStatus'],
+              description: 'Group counts/totals by this field, e.g. "how many projects per stage".',
+            },
+            city: { type: 'string', description: 'Filter by city, e.g. "Gurugram".' },
+            state: { type: 'string', description: 'Filter by state, e.g. "Haryana".' },
+            zone: { type: 'string', description: 'Filter by zone, e.g. "Gurgaon".' },
+            stage: { type: 'string', description: 'Filter by stage, e.g. "Execution", "Design-Sales".' },
+            subStage: { type: 'string', description: 'Filter by sub-stage, e.g. "Handover".' },
+            owner: { type: 'string', description: 'Filter by owner/team, e.g. "SMB Team".' },
+            channel: { type: 'string', description: 'Filter by channel, e.g. "Digital".' },
+            projectStatus: { type: 'string', description: 'Filter by project status, e.g. "Cancelled", "InProgress".' },
+            companyName: { type: 'string', description: 'Filter by company/project company name, e.g. "Officebanao".' },
+            customerName: { type: 'string', description: 'Filter by the customer contact name.' },
+            minValue: { type: 'number', description: 'estimatedValue >= this (in rupees). Convert "2 cr" -> 20000000, "40 lakh" -> 4000000.' },
+            maxValue: { type: 'number', description: 'estimatedValue <= this (in rupees).' },
+            minArea: { type: 'number', description: 'areaSft >= this (in sqft).' },
+            maxArea: { type: 'number', description: 'areaSft <= this (in sqft).' },
           },
         },
       },
@@ -81,14 +111,15 @@ export class PlannerService {
   private buildSystemInstruction(customerId: string): string {
     return `${SYSTEM_PROMPT}
 
+${TABLE_FORMAT_INSTRUCTION}
+
 You are the PLANNER. Decide which tool(s) to call to answer the user, call them, read the results, then write the final answer.
 Rules:
 - The customerId is "${customerId}" and is already known — never ask the user for it.
-- For totals, counts, averages, rankings, or filtered sums/lists, you MUST call projectAnalytics and use its exact numbers. Do not calculate numbers yourself.
+- For totals, counts, averages, rankings, filtered sums/lists, or ANY chart/comparison request, you MUST call projectAnalytics. Do not calculate numbers yourself.
 - For descriptive questions about a specific project, call searchProjects.
 - Base every fact and number ONLY on tool results. If the tools return nothing relevant, say you don't have that information.
-- When you have enough information, reply with the final answer as plain text (no tool call).
-${TABLE_FORMAT_INSTRUCTION}`;
+- When you have enough information, reply with the final answer as a markdown table (if multiple records) or plain text (if single fact).`;
   }
 
   // Run the tool-calling loop until the model has everything it needs to answer.
@@ -155,8 +186,9 @@ ${TABLE_FORMAT_INSTRUCTION}`;
     customerId: string;
     history?: Array<{ role: string; content: string }>;
     res: Response;
+    onAnswer?: (answer: string) => void;
   }): Promise<void> {
-    const { question, customerId, history = [], res } = params;
+    const { question, customerId, history = [], res, onAnswer } = params;
 
     const messages: any[] = [
       { role: 'system', content: this.buildSystemInstruction(customerId) },
@@ -169,6 +201,7 @@ ${TABLE_FORMAT_INSTRUCTION}`;
     // saving one full generation round-trip per request.
     const { finalText } = await this.resolveTools(messages, customerId);
     const answer = finalText || 'I could not complete the request within the allowed number of steps.';
+    onAnswer?.(answer);
 
     // Emulate token streaming by writing the answer in small chunks so the UI keeps
     // its typing effect, without the cost of a real second streamed generation.
@@ -211,11 +244,19 @@ ${TABLE_FORMAT_INSTRUCTION}`;
           role: args.role,
           groupBy: args.groupBy,
           city: args.city,
+          state: args.state,
           zone: args.zone,
           stage: args.stage,
+          subStage: args.subStage,
           owner: args.owner,
+          channel: args.channel,
+          projectStatus: args.projectStatus,
+          companyName: args.companyName,
+          customerName: args.customerName,
           minValue: args.minValue,
           maxValue: args.maxValue,
+          minArea: args.minArea,
+          maxArea: args.maxArea,
         });
       }
 

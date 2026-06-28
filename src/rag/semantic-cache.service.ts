@@ -29,15 +29,18 @@ export class SemanticCacheService {
     }
 
     if (hits.length && hits[0]?.payload?.answer) {
+      console.log(`[SemanticCache] HIT score=${hits[0].score?.toFixed(3)} q="${question.slice(0, 60)}"`);
       return { answer: hits[0].payload.answer, embedding };
     }
 
+    console.log(`[SemanticCache] MISS q="${question.slice(0, 60)}"`);
     return { answer: null, embedding };
   }
 
   async save(question: string, embedding: number[], answer: string, customerId: string): Promise<void> {
-    if (!answer?.trim()) return;
+    if (!answer?.trim() || !embedding?.length) return;
     try {
+      await this.qdrantService.createCollection(CACHE_COLLECTION);
       await this.qdrantService.upsert(CACHE_COLLECTION, [
         {
           id: crypto.randomUUID(),
@@ -45,9 +48,9 @@ export class SemanticCacheService {
           payload: { question, answer, customerId, cachedAt: new Date().toISOString() },
         },
       ]);
+      console.log(`[SemanticCache] SAVED q="${question.slice(0, 60)}"`);
     } catch (err) {
-      // Cache write failure is non-fatal
-      console.error('SemanticCache save error:', err?.message);
+      console.error('[SemanticCache] save error:', (err as any)?.message);
     }
   }
 }

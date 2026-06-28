@@ -2,13 +2,15 @@ import { Injectable } from '@nestjs/common';
 import { QdrantService } from './qdrant.service';
 import { COLLECTION } from './constants';
 
-type Metric = 'estimatedValue' | 'boqValue';
+type Metric = 'estimatedValue' | 'boqValue' | 'area';
 
 // Each metric maps to a document type + the numeric payload field to aggregate.
 // 'boqValue' = the BOQ amount (cost) on boq docs, which now carry the project name.
-const METRIC_CONFIG: Record<Metric, { docType: 'project' | 'boq'; field: string }> = {
+// 'area' = project area in sqft (clean numeric data, good for charts).
+const METRIC_CONFIG: Record<Metric, { docType: 'project' | 'boq'; field: string; isArea?: boolean }> = {
   estimatedValue: { docType: 'project', field: 'estimatedValue' },
   boqValue: { docType: 'boq', field: 'cost' },
+  area: { docType: 'project', field: 'areaSft', isArea: true },
 };
 
 export interface AnalyticsQuery {
@@ -17,13 +19,21 @@ export interface AnalyticsQuery {
   topN?: number;
   teamMember?: string;
   role?: string;
-  groupBy?: 'stage' | 'city' | 'owner';
+  groupBy?: 'stage' | 'subStage' | 'city' | 'state' | 'zone' | 'owner' | 'channel' | 'projectStatus';
   city?: string;
+  state?: string;
   zone?: string;
   stage?: string;
+  subStage?: string;
   owner?: string;
+  channel?: string;
+  projectStatus?: string;
+  companyName?: string;
+  customerName?: string;
   minValue?: number;
   maxValue?: number;
+  minArea?: number;
+  maxArea?: number;
 }
 
 /**
@@ -86,34 +96,41 @@ export class ProjectAnalyticsService {
   }
 
   async analyze(query: AnalyticsQuery) {
-    const metric: Metric = query.metric || 'estimatedValue';
+    // The LLM sometimes passes an unsupported metric (e.g. "area"/"cost"); fall back
+    // to estimatedValue instead of crashing on an undefined config lookup.
+    const metric: Metric = METRIC_CONFIG[query.metric as Metric] ? (query.metric as Metric) : 'estimatedValue';
     const { docType, field } = METRIC_CONFIG[metric];
-    const topN = query.topN ?? 5;
+    const topN = query.topN ?? 50;
 
     let docs = await this.loadDocs(query.customerId, docType);
 
-    // Filter by city
-    if (query.city) {
-      const c = query.city.trim().toLowerCase();
-      docs = docs.filter((p) => (p.city || '').trim().toLowerCase() === c);
-    }
+    // Exact (case-insensitive) equality filters on payload fields.
+    const eq = (field: string, val?: string) => {
+      if (!val) return;
+      const v = val.trim().toLowerCase();
+      docs = docs.filter((p) => (p[field] || '').toString().trim().toLowerCase() === v);
+    };
+    // Substring (case-insensitive) filters — better for free-text-ish fields.
+    const includes = (field: string, val?: string) => {
+      if (!val) return;
+      const v = val.trim().toLowerCase();
+      docs = docs.filter((p) => (p[field] || '').toString().trim().toLowerCase().includes(v));
+    };
 
-    // Filter by zone
-    if (query.zone) {
-      const z = query.zone.trim().toLowerCase();
-      docs = docs.filter((p) => (p.zone || '').trim().toLowerCase().includes(z));
-    }
+    eq('city', query.city);
+    eq('state', query.state);
+    includes('zone', query.zone);
+    eq('stage', query.stage);
+    eq('subStage', query.subStage);
+    eq('owner', query.owner);
+    eq('channel', query.channel);
+    eq('projectStatus', query.projectStatus);
+    includes('companyName', query.companyName);
 
-    // Filter by stage
-    if (query.stage) {
-      const s = query.stage.trim().toLowerCase();
-      docs = docs.filter((p) => (p.stage || '').trim().toLowerCase() === s);
-    }
-
-    // Filter by owner
-    if (query.owner) {
-      const o = query.owner.trim().toLowerCase();
-      docs = docs.filter((p) => (p.owner || '').trim().toLowerCase() === o);
+    // Customer name lives in the nested customerInfo object.
+    if (query.customerName) {
+      const n = query.customerName.trim().toLowerCase();
+      docs = docs.filter((p) => (p.customerInfo?.name || '').toString().trim().toLowerCase().includes(n));
     }
 
     // Filter by value range
@@ -122,6 +139,14 @@ export class ProjectAnalyticsService {
     }
     if (query.maxValue !== undefined) {
       docs = docs.filter((p) => this.num(p[field]) <= query.maxValue);
+    }
+
+    // Filter by area range (areaSft)
+    if (query.minArea !== undefined) {
+      docs = docs.filter((p) => this.num(p.areaSft) >= query.minArea);
+    }
+    if (query.maxArea !== undefined) {
+      docs = docs.filter((p) => this.num(p.areaSft) <= query.maxArea);
     }
 
     // Team filtering only applies to project docs (BOQ docs have no team).
@@ -139,8 +164,14 @@ export class ProjectAnalyticsService {
         boqCode: docType === 'boq' ? p.boqCode : undefined,
         status: docType === 'boq' ? p.status : undefined,
         city: p.city,
+        state: p.state,
+        zone: p.zone,
         stage: p.stage,
+        subStage: p.subStage,
+        channel: p.channel,
+        projectStatus: p.projectStatus,
         owner: p.owner,
+        area: this.num(p.areaSft),
         value: val,
         formattedValue: this.formatNumber(val, p[field]),
       };
