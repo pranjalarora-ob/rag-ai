@@ -47,6 +47,16 @@ export class ChatDto {
   customerId: string;
 }
 
+export class ChatHistoryMessageDto {
+  @ApiProperty({ description: 'Message role', enum: ['user', 'assistant'] })
+  @IsString()
+  role: string;
+
+  @ApiProperty({ description: 'Message content' })
+  @IsString()
+  content: string;
+}
+
 export class PlannerDto {
   @ApiProperty({ description: 'Question to ask the planner' })
   @IsString()
@@ -55,4 +65,11 @@ export class PlannerDto {
   @ApiProperty({ description: 'Customer identifier' })
   @IsString()
   customerId: string;
+
+  @ApiProperty({ description: 'Prior conversation turns for context', type: [ChatHistoryMessageDto], required: false })
+  @IsOptional()
+  @IsArray()
+  @ValidateNested({ each: true })
+  @Type(() => ChatHistoryMessageDto)
+  history?: ChatHistoryMessageDto[];
 }

@@ -1,27 +1,79 @@
 *, *::before, *::after { box-sizing: border-box; }
 
 :root {
-  --bg:       #0f1117;
-  --surface:  #181b24;
-  --border:   #262b38;
-  --text:     #e2e5ef;
-  --muted:    #8892a4;
-  --accent:   #6ea8fe;
-  --accent2:  #7ee0c0;
-  --user-bg:  #1e2330;
-  --bot-bg:   #181b24;
-  --sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  /* Surfaces — layered depth from base to raised */
+  --bg:          #0b0d13;
+  --bg-grad-1:   #0d1018;
+  --bg-grad-2:   #0a0c11;
+  --surface:     #14171f;
+  --surface-2:   #1a1e28;
+  --surface-3:   #20252f;
+  --glass:       rgba(22, 26, 34, 0.72);
+
+  /* Borders */
+  --border:      #242a37;
+  --border-soft: #1c212c;
+  --border-glow: rgba(110, 168, 254, 0.35);
+
+  /* Text */
+  --text:     #eef1f8;
+  --text-2:   #c4cbda;
+  --muted:    #7e879a;
+  --faint:    #5a6273;
+
+  /* Accents */
+  --accent:       #6ea8fe;
+  --accent-hi:    #93c0ff;
+  --accent2:      #7ee0c0;
+  --accent-glow:  rgba(110, 168, 254, 0.18);
+  --accent-grad:  linear-gradient(135deg, #6ea8fe 0%, #8b7dfc 100%);
+
+  /* Message backgrounds */
+  --user-bg:  linear-gradient(135deg, #1d2433 0%, #1a2030 100%);
+
+  /* Shadows */
+  --shadow-sm: 0 1px 2px rgba(0,0,0,.3);
+  --shadow:    0 8px 24px -8px rgba(0,0,0,.5);
+  --shadow-lg: 0 16px 48px -12px rgba(0,0,0,.6);
+  --shadow-glow: 0 0 0 1px rgba(110,168,254,.25), 0 8px 32px -8px rgba(110,168,254,.25);
+
+  --sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Inter', sans-serif;
   --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+
+  --radius:    14px;
+  --radius-lg: 20px;
+  --ease: cubic-bezier(.22, .61, .36, 1);
 }
+
+html, body { height: 100%; }
 
 body {
   margin: 0;
-  background: var(--bg);
+  background:
+    radial-gradient(1200px 600px at 75% -10%, rgba(110,168,254,.07), transparent 60%),
+    radial-gradient(900px 500px at 10% 110%, rgba(126,224,192,.05), transparent 55%),
+    linear-gradient(180deg, var(--bg-grad-1), var(--bg-grad-2));
+  background-attachment: fixed;
   color: var(--text);
   font-family: var(--sans);
   font-size: 15px;
   line-height: 1.6;
   -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
 }
 
 #root { height: 100dvh; display: flex; flex-direction: column; }
+
+::selection { background: rgba(110,168,254,.3); color: #fff; }
+
+/* Custom scrollbar */
+* { scrollbar-width: thin; scrollbar-color: #2a3140 transparent; }
+*::-webkit-scrollbar { width: 10px; height: 10px; }
+*::-webkit-scrollbar-track { background: transparent; }
+*::-webkit-scrollbar-thumb {
+  background: #262d3b;
+  border-radius: 8px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+*::-webkit-scrollbar-thumb:hover { background: #333c4d; background-clip: content-box; }

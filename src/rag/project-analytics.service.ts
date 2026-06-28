@@ -13,14 +13,17 @@ const METRIC_CONFIG: Record<Metric, { docType: 'project' | 'boq'; field: string 
 
 export interface AnalyticsQuery {
   customerId: string;
-  metric?: Metric;          // money field to aggregate (default estimatedValue)
-  topN?: number;            // how many top projects to return (default 5)
-  teamMember?: string;      // filter to projects where this person is on the team
-  role?: string;            // optional role to match alongside teamMember
+  metric?: Metric;
+  topN?: number;
+  teamMember?: string;
+  role?: string;
   groupBy?: 'stage' | 'city' | 'owner';
-  city?: string;            // optional city to filter by
-  stage?: string;           // optional stage to filter by
-  owner?: string;           // optional owner to filter by
+  city?: string;
+  zone?: string;
+  stage?: string;
+  owner?: string;
+  minValue?: number;
+  maxValue?: number;
 }
 
 /**
@@ -95,6 +98,12 @@ export class ProjectAnalyticsService {
       docs = docs.filter((p) => (p.city || '').trim().toLowerCase() === c);
     }
 
+    // Filter by zone
+    if (query.zone) {
+      const z = query.zone.trim().toLowerCase();
+      docs = docs.filter((p) => (p.zone || '').trim().toLowerCase().includes(z));
+    }
+
     // Filter by stage
     if (query.stage) {
       const s = query.stage.trim().toLowerCase();
@@ -105,6 +114,14 @@ export class ProjectAnalyticsService {
     if (query.owner) {
       const o = query.owner.trim().toLowerCase();
       docs = docs.filter((p) => (p.owner || '').trim().toLowerCase() === o);
+    }
+
+    // Filter by value range
+    if (query.minValue !== undefined) {
+      docs = docs.filter((p) => this.num(p[field]) >= query.minValue);
+    }
+    if (query.maxValue !== undefined) {
+      docs = docs.filter((p) => this.num(p[field]) <= query.maxValue);
     }
 
     // Team filtering only applies to project docs (BOQ docs have no team).

@@ -15,6 +15,7 @@ import { ProjectAnalyticsService, AnalyticsQuery } from './project-analytics.ser
 import { PlannerService } from './planner.service';
 import { RerankService } from './rerank.service';
 import { ProjectAgentService } from './project-agent.service';
+import { SemanticCacheService } from './semantic-cache.service';
 import { SYSTEM_PROMPT, COLLECTION } from './constants';
 
 @ApiTags('RAG')
@@ -29,6 +30,7 @@ export class RagController {
     private readonly plannerService: PlannerService,
     private readonly rerankService: RerankService,
     private readonly projectAgentService: ProjectAgentService,
+    private readonly semanticCache: SemanticCacheService,
   ) { }
 
   // ============ Ingestion ============
@@ -93,6 +95,28 @@ export class RagController {
     return this.plannerService.run({ question: body.question, customerId: body.customerId });
   }
 
+  @ApiOperation({ summary: 'Planner agent (streaming) — same tool loop, streams the final answer as plain text.' })
+  @ApiProduces('text/event-stream')
+  @Post('planner/stream')
+  async plannerStream(@Body() body: PlannerDto, @Res() res: Response) {
+    if (!body?.customerId) throw new BadRequestException('customerId is required');
+    try {
+      if (this.guardrailService.isPolicyViolation(body.question)) {
+        throw new BadRequestException('Query violates company policy.');
+      }
+      await this.plannerService.runStream({
+        question: body.question,
+        customerId: body.customerId,
+        history: body.history,
+        res,
+      });
+    } catch (err) {
+      console.error(err);
+      if (!res.headersSent) throw new InternalServerErrorException('Planner stream failed');
+      if (!res.writableEnded) res.end();
+    }
+  }
+
   @ApiOperation({ summary: 'Agent — LLM turns the question into a structured query, run deterministically (exact filters/sort/count). Returns answer + trace.' })
   @Post('agent')
   agent(@Body() body: PlannerDto) {
@@ -113,6 +137,15 @@ export class RagController {
       if (this.guardrailService.isPolicyViolation(question)) {
         throw new BadRequestException('Query violates company policy.');
       }
+
+      // ── Semantic cache check ──────────────────────────────────────────────────
+      const cache = await this.semanticCache.check(question, customerId);
+      if (cache.answer) {
+        res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+        res.send(cache.answer);
+        return;
+      }
+      // ─────────────────────────────────────────────────────────────────────────
 
       // Structured LISTING queries ("all leads in Gurugram", "projects with area > 5000")
       // must use the filter/scroll path — NOT the aggregate analytics tool, which ignores
@@ -259,6 +292,8 @@ export class RagController {
         }
         res.setHeader('Content-Type', 'text/plain; charset=utf-8');
         res.send(answer);
+        // Save to semantic cache after sending (non-blocking)
+        this.semanticCache.save(question, cache.embedding, answer, customerId).catch(() => {});
         return;
       }
 
