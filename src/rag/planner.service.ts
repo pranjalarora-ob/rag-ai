@@ -19,6 +19,11 @@ RULE 2 — NEVER use bullet points or numbered lists when showing multiple proje
 RULE 3 — ALWAYS use a markdown table when showing 2+ projects. Exact columns:
   | # | Code | Name | City | Area (sqft) | Estimated Value |
   Use RAW integers in Area and Estimated Value (NO commas, NO "Cr"/"L" suffix, NO units).
+  COLUMN MAPPING (STRICT): take the "Area (sqft)" column from each row's "area" field
+  and the "Estimated Value" column from each row's "estimatedValue" field. NEVER use the
+  ranking "value" field for the Estimated Value column — when ranking by area, "value"
+  equals the area and must NOT be repeated as the estimated value. Area and Estimated
+  Value are different numbers; never output the same number in both columns.
 
 RULE 4 — When the user asks for a "chart", "graph", "pie", "bar", "comparison", or "visualize":
   → Call projectAnalytics with metric="area" (or relevant metric) and topN=50
@@ -81,6 +86,7 @@ export class PlannerService {
           properties: {
             metric: { type: 'string', enum: ['estimatedValue', 'boqValue', 'area'], description: 'What to rank/total/chart by. Use "area" for area-based questions ("compare their area", "largest by area").' },
             topN: { type: 'number', description: 'Return only the top N by value/area. Set to 50 when asked to chart/compare all results or when a previous list was longer than 5.' },
+            projectCodes: { type: 'array', items: { type: 'string' }, description: 'Look up SPECIFIC projects by their exact project code(s), e.g. ["2022072479"]. ALWAYS use this when the user names one or more project codes — never search by meaning for a code.' },
             teamMember: { type: 'string', description: 'Filter to projects where this person is on the team.' },
             role: { type: 'string', description: 'Role to match with teamMember, e.g. "Design Manager".' },
             groupBy: {
@@ -100,8 +106,10 @@ export class PlannerService {
             customerName: { type: 'string', description: 'Filter by the customer contact name.' },
             minValue: { type: 'number', description: 'estimatedValue >= this (in rupees). Convert "2 cr" -> 20000000, "40 lakh" -> 4000000.' },
             maxValue: { type: 'number', description: 'estimatedValue <= this (in rupees).' },
+            equalsValue: { type: 'number', description: 'estimatedValue EXACTLY equals this (in rupees). Use for "equal to"/"= X" queries. Convert "1.65L" -> 165000, "2 cr" -> 20000000. Takes precedence over min/maxValue.' },
             minArea: { type: 'number', description: 'areaSft >= this (in sqft).' },
             maxArea: { type: 'number', description: 'areaSft <= this (in sqft).' },
+            equalsArea: { type: 'number', description: 'areaSft EXACTLY equals this (in sqft). Use for "area equal to X". Takes precedence over min/maxArea.' },
           },
         },
       },
@@ -117,6 +125,7 @@ You are the PLANNER. Decide which tool(s) to call to answer the user, call them,
 Rules:
 - The customerId is "${customerId}" and is already known — never ask the user for it.
 - For totals, counts, averages, rankings, filtered sums/lists, or ANY chart/comparison request, you MUST call projectAnalytics. Do not calculate numbers yourself.
+- When the user names one or more specific project codes (e.g. "project code 2022072479"), call projectAnalytics with projectCodes set to those codes — never use searchProjects for an exact code.
 - For descriptive questions about a specific project, call searchProjects.
 - Base every fact and number ONLY on tool results. If the tools return nothing relevant, say you don't have that information.
 - When you have enough information, reply with the final answer as a markdown table (if multiple records) or plain text (if single fact).`;
@@ -240,6 +249,7 @@ Rules:
           customerId,
           metric: args.metric,
           topN: args.topN,
+          projectCodes: args.projectCodes,
           teamMember: args.teamMember,
           role: args.role,
           groupBy: args.groupBy,
@@ -255,8 +265,10 @@ Rules:
           customerName: args.customerName,
           minValue: args.minValue,
           maxValue: args.maxValue,
+          equalsValue: args.equalsValue,
           minArea: args.minArea,
           maxArea: args.maxArea,
+          equalsArea: args.equalsArea,
         });
       }
 

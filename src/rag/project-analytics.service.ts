@@ -17,6 +17,7 @@ export interface AnalyticsQuery {
   customerId: string;
   metric?: Metric;
   topN?: number;
+  projectCodes?: string[];
   teamMember?: string;
   role?: string;
   groupBy?: 'stage' | 'subStage' | 'city' | 'state' | 'zone' | 'owner' | 'channel' | 'projectStatus';
@@ -32,8 +33,10 @@ export interface AnalyticsQuery {
   customerName?: string;
   minValue?: number;
   maxValue?: number;
+  equalsValue?: number;
   minArea?: number;
   maxArea?: number;
+  equalsArea?: number;
 }
 
 /**
@@ -104,6 +107,14 @@ export class ProjectAnalyticsService {
 
     let docs = await this.loadDocs(query.customerId, docType);
 
+    // Exact lookup by project code(s). Normalizes a leading "P" and case so
+    // "2022072479", "p2022072479" and "P2022072479" all match the same record.
+    if (query.projectCodes?.length) {
+      const norm = (c: any) => (c || '').toString().trim().toLowerCase().replace(/^p/, '');
+      const wanted = new Set(query.projectCodes.map(norm));
+      docs = docs.filter((p) => wanted.has(norm(p.projectCode)));
+    }
+
     // Exact (case-insensitive) equality filters on payload fields.
     const eq = (field: string, val?: string) => {
       if (!val) return;
@@ -133,20 +144,28 @@ export class ProjectAnalyticsService {
       docs = docs.filter((p) => (p.customerInfo?.name || '').toString().trim().toLowerCase().includes(n));
     }
 
-    // Filter by value range
-    if (query.minValue !== undefined) {
-      docs = docs.filter((p) => this.num(p[field]) >= query.minValue);
-    }
-    if (query.maxValue !== undefined) {
-      docs = docs.filter((p) => this.num(p[field]) <= query.maxValue);
+    // Filter by value: exact match takes precedence over range.
+    if (query.equalsValue !== undefined) {
+      docs = docs.filter((p) => this.num(p[field]) === query.equalsValue);
+    } else {
+      if (query.minValue !== undefined) {
+        docs = docs.filter((p) => this.num(p[field]) >= query.minValue);
+      }
+      if (query.maxValue !== undefined) {
+        docs = docs.filter((p) => this.num(p[field]) <= query.maxValue);
+      }
     }
 
-    // Filter by area range (areaSft)
-    if (query.minArea !== undefined) {
-      docs = docs.filter((p) => this.num(p.areaSft) >= query.minArea);
-    }
-    if (query.maxArea !== undefined) {
-      docs = docs.filter((p) => this.num(p.areaSft) <= query.maxArea);
+    // Filter by area (areaSft): exact match takes precedence over range.
+    if (query.equalsArea !== undefined) {
+      docs = docs.filter((p) => this.num(p.areaSft) === query.equalsArea);
+    } else {
+      if (query.minArea !== undefined) {
+        docs = docs.filter((p) => this.num(p.areaSft) >= query.minArea);
+      }
+      if (query.maxArea !== undefined) {
+        docs = docs.filter((p) => this.num(p.areaSft) <= query.maxArea);
+      }
     }
 
     // Team filtering only applies to project docs (BOQ docs have no team).
@@ -171,7 +190,12 @@ export class ProjectAnalyticsService {
         channel: p.channel,
         projectStatus: p.projectStatus,
         owner: p.owner,
+        // Always expose the REAL fields independently of the ranking metric, so the
+        // Area and Estimated Value columns never collapse into the same number when
+        // ranking by area (field === 'areaSft' would otherwise make value === area).
         area: this.num(p.areaSft),
+        estimatedValue: this.num(p.estimatedValue),
+        // `value` is the metric being ranked/summed (may equal area when metric==='area').
         value: val,
         formattedValue: this.formatNumber(val, p[field]),
       };

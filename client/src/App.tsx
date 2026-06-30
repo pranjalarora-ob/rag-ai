@@ -35,6 +35,10 @@ const CUSTOMER_ID = '7768d491-9dd4-4ac0-b85f-3ff68fc7d87e'
 const API_URL = '/rag/planner/stream'
 const STORAGE_KEY = 'pi_chats_v1'
 const MAX_SAVED_CHATS = 30
+// Source data occasionally carries corrupt values (e.g. 6e51). Treat any rupee
+// amount above this ceiling as junk: hide it in cells and exclude it from KPIs.
+// ₹1 lakh crore — no single project realistically exceeds this.
+const MAX_SANE_VALUE = 1e13
 const SUGGESTIONS = [
   'List projects in Gurugram with estimated value > 2 cr',
   'How many projects are in Design-Sales stage?',
@@ -63,6 +67,7 @@ function fmtNum(n: number, isArea: boolean): string {
 function fmtCurrency(raw: string): string {
   const n = parseFloat((raw || '').replace(/[^\d.eE+\-]/g, ''))
   if (!Number.isFinite(n) || n <= 0) return raw
+  if (n > MAX_SANE_VALUE) return '⚠ invalid'
   if (n >= 1e7) return `₹${(n / 1e7).toFixed(2)} Cr`
   if (n >= 1e5) return `₹${(n / 1e5).toFixed(2)} L`
   return `₹${n.toLocaleString('en-IN')}`
@@ -339,13 +344,16 @@ function DataTable({ headers, rows }: { headers: string[]; rows: string[][] }) {
   const kinds = useMemo(() => headers.map(colKind), [headers])
   const valueIdx = kinds.indexOf('currency')
 
-  // KPI cards computed from the currency column (if any)
+  // KPI cards computed from the currency column (if any). Junk values above the
+  // sanity ceiling are excluded so totals/averages aren't poisoned by bad data.
   const kpi = useMemo(() => {
     if (valueIdx === -1) return null
-    const nums = rows.map(r => cellNumber(r[valueIdx])).filter(n => Number.isFinite(n) && n > 0)
+    const nums = rows.map(r => cellNumber(r[valueIdx]))
+      .filter(n => Number.isFinite(n) && n > 0 && n <= MAX_SANE_VALUE)
     if (!nums.length) return null
     const total = nums.reduce((a, b) => a + b, 0)
-    return { count: rows.length, total, avg: total / nums.length }
+    const excluded = rows.length - nums.length
+    return { count: rows.length, total, avg: total / nums.length, excluded }
   }, [rows, valueIdx])
 
   const sortedRows = useMemo(() => {
@@ -405,7 +413,10 @@ function DataTable({ headers, rows }: { headers: string[]; rows: string[][] }) {
       {kpi && (
         <div className="kpi-row">
           <div className="kpi"><span className="kpi-label">Results</span><span className="kpi-value">{kpi.count}</span></div>
-          <div className="kpi"><span className="kpi-label">Total {headers[valueIdx]}</span><span className="kpi-value">{fmtNum(kpi.total, false)}</span></div>
+          <div className="kpi">
+            <span className="kpi-label">Total {headers[valueIdx]}{kpi.excluded ? ` · ${kpi.excluded} excluded` : ''}</span>
+            <span className="kpi-value">{fmtNum(kpi.total, false)}</span>
+          </div>
           <div className="kpi"><span className="kpi-label">Average</span><span className="kpi-value">{fmtNum(kpi.avg, false)}</span></div>
         </div>
       )}
@@ -605,11 +616,6 @@ export default function App() {
       chatId = activeId
     }
 
-    // Prior turns become context for the planner (skip empty/loading bubbles).
-    const history = messages
-      .filter(m => m.content && !m.loading)
-      .map(m => ({ role: m.role, content: m.content }))
-
     const userMsg: Message = { id: ++msgId, role: 'user', content: q }
     const botId = ++msgId
     const botMsg: Message = { id: botId, role: 'assistant', content: '', loading: true }
@@ -620,7 +626,7 @@ export default function App() {
       const res = await fetch(API_URL, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ question: q, customerId: CUSTOMER_ID, history }),
+        body: JSON.stringify({ question: q, customerId: CUSTOMER_ID }),
       })
       if (!res.ok) throw new Error(`Server error ${res.status}`)
 
@@ -682,7 +688,7 @@ export default function App() {
           ))}
         </div>
 
-        <div className="sidebar-foot">Stored locally on this device</div>
+        {/* <div className="sidebar-foot">Stored locally on this device</div> */}
       </aside>
 
       {/* ── Main ── */}
@@ -700,7 +706,7 @@ export default function App() {
           <span className="header-badge">Online</span>
         </header>
 
-        <main className="chat-area">
+        <main className="chat-area" key={activeId ?? 'empty'}>
           {messages.length === 0 ? (
             <div className="empty-state">
               <div className="empty-icon">◈</div>
