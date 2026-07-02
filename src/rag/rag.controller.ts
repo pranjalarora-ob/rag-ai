@@ -15,6 +15,7 @@ import { ProjectAnalyticsService, AnalyticsQuery } from './project-analytics.ser
 import { PlannerService } from './planner.service';
 import { RerankService } from './rerank.service';
 import { ProjectAgentService } from './project-agent.service';
+import { AgentGraphService } from './agent-graph.service';
 import { SemanticCacheService } from './semantic-cache.service';
 import { SYSTEM_PROMPT, COLLECTION } from './constants';
 
@@ -30,6 +31,7 @@ export class RagController {
     private readonly plannerService: PlannerService,
     private readonly rerankService: RerankService,
     private readonly projectAgentService: ProjectAgentService,
+    private readonly agentGraphService: AgentGraphService,
     private readonly semanticCache: SemanticCacheService,
   ) { }
 
@@ -136,6 +138,38 @@ export class RagController {
   agent(@Body() body: PlannerDto) {
     if (!body?.customerId) throw new BadRequestException('customerId is required');
     return this.projectAgentService.run({ question: body.question, customerId: body.customerId });
+  }
+
+  // ============ Agent Graph (LangGraph multi-agent) ============
+
+  @ApiOperation({ summary: 'Agent graph — LangGraph multi-agent (guardrail → cache → supervisor → analytics/lookup/search). Returns answer + route + trace.' })
+  @Post('agent-graph')
+  agentGraph(@Body() body: PlannerDto) {
+    if (!body?.customerId) throw new BadRequestException('customerId is required');
+    return this.agentGraphService.run({
+      question: body.question,
+      customerId: body.customerId,
+      history: body.history,
+    });
+  }
+
+  @ApiOperation({ summary: 'Agent graph (streaming) — same LangGraph multi-agent flow, streams the final answer as plain text.' })
+  @ApiProduces('text/event-stream')
+  @Post('agent-graph/stream')
+  async agentGraphStream(@Body() body: PlannerDto, @Res() res: Response) {
+    if (!body?.customerId) throw new BadRequestException('customerId is required');
+    try {
+      await this.agentGraphService.runStream({
+        question: body.question,
+        customerId: body.customerId,
+        history: body.history,
+        res,
+      });
+    } catch (err) {
+      console.error(err);
+      if (!res.headersSent) throw new InternalServerErrorException('Agent graph stream failed');
+      if (!res.writableEnded) res.end();
+    }
   }
 
   // ============ Chat (streaming, with routing) ============

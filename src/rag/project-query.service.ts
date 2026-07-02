@@ -47,7 +47,9 @@ export class ProjectQueryService {
       { key: 'docType', match: { value: 'project' } },
     ];
     if (spec.type) must.push({ key: 'type', match: { value: spec.type } });
-    if (spec.projectCode) must.push({ key: 'projectCode', match: { value: spec.projectCode } });
+    // projectCode is stored as a STRING in Qdrant — match as string even though the
+    // tool passes a number (integer match would return zero rows).
+    if (spec.projectCode) must.push({ key: 'projectCode', match: { value: String(spec.projectCode) } });
     if (spec.area) must.push({ key: 'areaSft', range: this.toRange(spec.area) });
     if (spec.estimatedValue) must.push({ key: 'estimatedValue', range: this.toRange(spec.estimatedValue) });
 

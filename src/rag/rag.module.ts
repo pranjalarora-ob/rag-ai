@@ -9,6 +9,7 @@ import { PlannerService } from './planner.service';
 import { RerankService } from './rerank.service';
 import { ProjectQueryService } from './project-query.service';
 import { ProjectAgentService } from './project-agent.service';
+import { AgentGraphService } from './agent-graph.service';
 import { IngestionController } from './ingest/ingestion.controller';
 import { IngestionService } from './ingest/ingestion.service';
 import { PgService } from './ingest/pg.service';
@@ -28,6 +29,7 @@ import { SemanticCacheService } from './semantic-cache.service';
     RerankService,
     ProjectQueryService,
     ProjectAgentService,
+    AgentGraphService,
     IngestionService,
     PgService,
     WatermarkStore,
