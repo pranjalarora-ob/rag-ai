@@ -108,7 +108,7 @@ export const projectSource: SourceDefinition = {
         projectId: row.id,
         accountId: row.account_id,
         customerId: row.account_id, // keeps the existing chat/analytics customerId filter working
-        projectCode: row.code,
+        projectCode: row.code ? String(row.code) : null,
         projectName: row.name,
         companyName: row.company_name,
         customerInfo: {

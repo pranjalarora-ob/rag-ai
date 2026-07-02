@@ -4,6 +4,7 @@ import { OpenaiService } from './openai.service';
 import { QdrantService } from './qdrant.service';
 import { ProjectAnalyticsService } from './project-analytics.service';
 import { RerankService } from './rerank.service';
+import { ClaudeService } from './claude.service';
 import { SYSTEM_PROMPT, COLLECTION } from './constants';
 
 const MAX_STEPS = 5; // safety cap on the tool→evaluate→tool loop
@@ -52,6 +53,7 @@ export class PlannerService {
     private readonly qdrantService: QdrantService,
     private readonly projectAnalyticsService: ProjectAnalyticsService,
     private readonly rerankService: RerankService,
+    private readonly claudeService: ClaudeService,
   ) { }
 
   private readonly tools = [
@@ -60,11 +62,24 @@ export class PlannerService {
       function: {
         name: 'searchProjects',
         description:
-          'Search project records by meaning. Use for DESCRIPTIVE lookups about a specific project — who is the design manager, what stage, details/notes. Returns matching project summaries.',
+          'Search project records semantically by meaning. You can also apply exact filters if the user question specifies them. Let the LLM decide which filters should apply.',
         parameters: {
           type: 'object',
           properties: {
-            query: { type: 'string', description: 'A natural-language search query.' },
+            query: { type: 'string', description: 'A natural-language semantic search query.' },
+            projectCode: { type: 'integer', description: 'Filter by exact project code.' },
+            city: { type: 'string', description: 'Filter by exact city name.' },
+            status: { type: 'string', description: 'Filter by project status, e.g. "Cancelled", "InProgress".' },
+            type: { type: 'string', enum: ['lead', 'project'], description: 'Filter to leads or projects.' },
+            docType: { type: 'string', enum: ['project', 'project-flow-phase', 'boq'], description: 'Filter to specific document type.' },
+            areaMin: { type: 'number', description: 'Min area in sqft.' },
+            areaMax: { type: 'number', description: 'Max area in sqft.' },
+            valueMin: { type: 'number', description: 'Min estimated value in rupees.' },
+            valueMax: { type: 'number', description: 'Max estimated value in rupees.' },
+            accountId: { type: 'string', description: 'Filter by account ID.' },
+            projectId: { type: 'string', description: 'Filter by project ID.' },
+            teamMemberId: { type: 'string', description: 'Filter by team member user ID.' },
+            parentId: { type: 'string', description: 'Filter by parent stage/milestone stage ID.' },
           },
           required: ['query'],
         },
@@ -129,12 +144,16 @@ Rules:
   private async resolveTools(
     messages: any[],
     customerId: string,
+    originalQuestion: string,
   ): Promise<{ trace: PlannerResult['trace']; finalText: string | null; steps: number }> {
     const trace: PlannerResult['trace'] = [];
 
     for (let step = 1; step <= MAX_STEPS; step++) {
-      const assistant = await this.openaiService.openRouterToolTurn(messages, this.tools);
+      const assistant = this.claudeService.isConfigured
+        ? await this.claudeService.claudeToolTurn(messages, this.tools)
+        : await this.openaiService.openRouterToolTurn(messages, this.tools);
       const toolCalls = assistant?.tool_calls;
+      console.log("toolCalls", toolCalls);
 
       if (!toolCalls || toolCalls.length === 0) {
         return { trace, finalText: assistant?.content ?? '', steps: step };
@@ -149,7 +168,7 @@ Rules:
         } catch {
           args = {};
         }
-        const result = await this.executeTool(call.function?.name, args, customerId);
+        const result = await this.executeTool(call.function?.name, args, customerId, originalQuestion);
         trace.push({ tool: call.function?.name, args, result });
         messages.push({ role: 'tool', tool_call_id: call.id, content: JSON.stringify(result) });
       }
@@ -171,7 +190,7 @@ Rules:
       { role: 'user', content: question },
     ];
 
-    const { trace, finalText, steps } = await this.resolveTools(messages, customerId);
+    const { trace, finalText, steps } = await this.resolveTools(messages, customerId, question);
     return {
       answer: finalText ?? 'I could not complete the request within the allowed number of steps.',
       trace,
@@ -189,7 +208,7 @@ Rules:
     onAnswer?: (answer: string) => void;
   }): Promise<void> {
     const { question, customerId, history = [], res, onAnswer } = params;
-
+    console.log("runStream", question);
     const messages: any[] = [
       { role: 'system', content: this.buildSystemInstruction(customerId) },
       ...history,
@@ -199,8 +218,9 @@ Rules:
     // Drive the tool loop. Its final turn already produces the answer text, so we
     // reuse that instead of re-generating it with a second streaming LLM call —
     // saving one full generation round-trip per request.
-    const { finalText } = await this.resolveTools(messages, customerId);
+    const { finalText } = await this.resolveTools(messages, customerId, question);
     const answer = finalText || 'I could not complete the request within the allowed number of steps.';
+    console.log("finalText", finalText)
     onAnswer?.(answer);
 
     // Emulate token streaming by writing the answer in small chunks so the UI keeps
@@ -219,19 +239,135 @@ Rules:
     if (!res.writableEnded) res.end();
   }
 
-  private async executeTool(name: string, args: any, customerId: string) {
+  private async executeTool(name: string, args: any, customerId: string, originalQuestion?: string) {
     try {
       if (name === 'searchProjects') {
-        const embedding = await this.openaiService.generateEmbedding(args.query || '');
-        const hits = await this.qdrantService.search(COLLECTION, {
-          vector: embedding,
-          limit: 50,
-          filter: { must: [{ key: 'customerId', match: { value: customerId } }] },
-        });
+        const queryStr = args.query || '';
+        const embedding = await this.openaiService.generateEmbedding(queryStr);
+
+        const filterMust: any[] = [{ key: 'customerId', match: { value: customerId } }];
+
+        // 1. projectCode
+        const projectCode = args.projectCode || queryStr.match(/\b(\d{6,})\b/)?.[1] || (originalQuestion || '').match(/\b(\d{6,})\b/)?.[1];
+        if (projectCode) {
+          filterMust.push({
+            key: 'projectCode',
+            match: { value: String(projectCode) }
+          });
+        }
+
+        // 2. city
+        let city = args.city;
+        if (!city && !projectCode) {
+          city = this.parseCity(queryStr);
+          if (!city && originalQuestion) {
+            city = this.parseCity(originalQuestion);
+          }
+        }
+        if (city) {
+          const capitalized = city.charAt(0).toUpperCase() + city.slice(1).toLowerCase();
+          filterMust.push({
+            key: 'city',
+            match: { any: [city, city.toLowerCase(), city.toUpperCase(), capitalized] }
+          });
+        }
+
+        // 3. status
+        if (args.status) {
+          filterMust.push({ key: 'status', match: { value: args.status } });
+        }
+
+        // 4. type
+        let typeFilter = args.type;
+        if (!typeFilter && !projectCode) {
+          typeFilter = this.parseType(queryStr);
+          if (!typeFilter && originalQuestion) {
+            typeFilter = this.parseType(originalQuestion);
+          }
+        }
+        if (typeFilter) {
+          filterMust.push({ key: 'type', match: { value: typeFilter } });
+        }
+
+        // 5. docType
+        if (args.docType) {
+          filterMust.push({ key: 'docType', match: { value: args.docType } });
+        } else {
+          const isFlowPhaseQuery = /phase|milestone|stage|workflow/i.test(queryStr) ||
+            (originalQuestion && /phase|milestone|stage|workflow/i.test(originalQuestion));
+          if (!isFlowPhaseQuery && !projectCode) {
+            filterMust.push({ key: 'docType', match: { value: 'project' } });
+          }
+        }
+
+        // 6. accountId
+        if (args.accountId) {
+          filterMust.push({ key: 'accountId', match: { value: args.accountId } });
+        }
+
+        // 7. projectId
+        if (args.projectId) {
+          filterMust.push({ key: 'projectId', match: { value: args.projectId } });
+        }
+
+        // 8. teamMemberId
+        if (args.teamMemberId) {
+          filterMust.push({ key: 'team[].userId', match: { value: args.teamMemberId } });
+        }
+
+        // 9. parentId
+        if (args.parentId) {
+          filterMust.push({ key: 'parentId', match: { value: args.parentId } });
+        }
+
+        // 10. area range
+        if (args.areaMin !== undefined || args.areaMax !== undefined) {
+          const range: any = {};
+          if (args.areaMin !== undefined) range.gte = args.areaMin;
+          if (args.areaMax !== undefined) range.lte = args.areaMax;
+          filterMust.push({ key: 'areaSft', range });
+        } else if (!projectCode) {
+          let areaRange = this.parseNumericRange(queryStr, ['area', 'sqft', 'sft', 'square feet', 'square foot']);
+          if (!areaRange && originalQuestion) {
+            areaRange = this.parseNumericRange(originalQuestion, ['area', 'sqft', 'sft', 'square feet', 'square foot']);
+          }
+          if (areaRange) {
+            filterMust.push({ key: 'areaSft', range: areaRange });
+          }
+        }
+
+        // 11. estimatedValue range
+        if (args.valueMin !== undefined || args.valueMax !== undefined) {
+          const range: any = {};
+          if (args.valueMin !== undefined) range.gte = args.valueMin;
+          if (args.valueMax !== undefined) range.lte = args.valueMax;
+          filterMust.push({ key: 'estimatedValue', range });
+        } else if (!projectCode) {
+          let valueRange = this.parseNumericRange(queryStr, ['estimated value', 'estimatedvalue', 'value', 'budget', 'worth']);
+          if (!valueRange && originalQuestion) {
+            valueRange = this.parseNumericRange(originalQuestion, ['estimated value', 'estimatedvalue', 'value', 'budget', 'worth']);
+          }
+          if (valueRange) {
+            filterMust.push({ key: 'estimatedValue', range: valueRange });
+          }
+        }
+        console.log("filterMust", filterMust);
+        let hits: any[];
+        if (projectCode) {
+          hits = await this.qdrantService.scrollAll(COLLECTION, { must: filterMust });
+        } else {
+          hits = await this.qdrantService.search(COLLECTION, {
+            vector: embedding,
+            limit: 10,
+            filter: { must: filterMust },
+          });
+        }
+        console.log(`[Qdrant Search] Received ${hits?.length || 0} chunks for query: "${queryStr}"`);
+        console.log("hitshits", hits);
         const rawChunks = hits
-          .sort((a: any, b: any) => b.score - a.score)
+          .sort((a: any, b: any) => (b.score ?? 1) - (a.score ?? 1))
           .map((h: any) => h.payload?.text as string);
-        const reranked = await this.rerankService.rerank(args.query || '', rawChunks, 10);
+        const reranked = await this.rerankService.rerank(queryStr, rawChunks, 10);
         return reranked.slice(0, 10);
       }
 
@@ -262,7 +398,57 @@ Rules:
 
       return { error: `Unknown tool: ${name}` };
     } catch (err: any) {
+      console.error('executeTool error:', err);
       return { error: err?.message || 'tool execution failed' };
     }
+  }
+
+  private parseNumericRange(
+    question: string,
+    keywords: string[],
+  ): { gt?: number; lt?: number; gte?: number; lte?: number } | null {
+    const q = question.toLowerCase();
+    const kw = keywords.map((k) => k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|');
+    const num = '([\\d,]+(?:\\.\\d+)?)\\s*(lakhs?|lacs?|crores?|cr|k|thousand|millions?|mn|billions?|bn)?';
+    const re = (ops: string) => new RegExp(`(?:${kw})[^.]*?(?:${ops})\\s*${num}`);
+    const val = (m: RegExpMatchArray) => {
+      let n = Number(m[1].replace(/,/g, ''));
+      const u = m[2];
+      if (u) {
+        if (/^la(kh|c)s?$/.test(u)) n *= 1e5;
+        else if (/^crores?$|^cr$/.test(u)) n *= 1e7;
+        else if (/^k$|^thousand$/.test(u)) n *= 1e3;
+        else if (/^millions?$|^mn$/.test(u)) n *= 1e6;
+        else if (/^billions?$|^bn$/.test(u)) n *= 1e9;
+      }
+      return n;
+    };
+    let m: RegExpMatchArray | null;
+    if ((m = q.match(re('more than|greater than|over|above|bigger than|>')))) return { gt: val(m) };
+    if ((m = q.match(re('at least|minimum|min|>=')))) return { gte: val(m) };
+    if ((m = q.match(re('less than|under|below|smaller than|<')))) return { lt: val(m) };
+    if ((m = q.match(re('at most|maximum|max|<=')))) return { lte: val(m) };
+    if ((m = q.match(re('exactly|equal to|equals|is|are|of|=')))) {
+      const n = val(m);
+      return { gte: n, lte: n };
+    }
+    return null;
+  }
+
+  private parseCity(question: string): string | null {
+    const stop = new Set(['progress', 'process', 'total', 'all', 'the', 'which', 'this', 'that', 'detail', 'details']);
+    const m = question.match(
+      /\b(?:projects?\s+(?:in|at|from)|located\s+(?:in|at)|based\s+in|city(?:\s+(?:of|is))?)\s+([A-Za-z][A-Za-z .]*?)(?:\s+(?:with|where|which|that|having|and|more|less|greater|area|estimated|value|sqft|sft|having)\b|[?.,]|$)/i,
+    );
+    if (!m) return null;
+    const city = m[1].trim();
+    if (city.length < 2 || stop.has(city.toLowerCase())) return null;
+    return city;
+  }
+
+  private parseType(question: string): 'lead' | 'project' | null {
+    if (/\blead(s)?\b/i.test(question)) return 'lead';
+    if (/\bproject(s)?\b/i.test(question)) return 'project';
+    return null;
   }
 }

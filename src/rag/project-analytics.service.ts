@@ -191,8 +191,11 @@ export class ProjectAnalyticsService {
       }
     }
 
+    const unit = metric === 'area' ? 'sqft' : 'rupees';
+
     return {
       metric,
+      unit,
       filter: {
         teamMember: query.teamMember || null,
         role: query.role || null,

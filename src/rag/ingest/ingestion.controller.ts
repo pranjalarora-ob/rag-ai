@@ -5,9 +5,9 @@ import { IngestionService } from './ingestion.service';
 @ApiTags('RAG Ingestion')
 @Controller('rag/ingest')
 export class IngestionController {
-  constructor(private readonly ingestion: IngestionService) {}
+  constructor(private readonly ingestion: IngestionService) { }
 
-  @ApiOperation({ summary: 'Backfill last N months (default 6) for a source: project | boq' })
+  @ApiOperation({ summary: 'Backfill last N months (default 6) for a source: project | boq | project-flow-detail' })
   @Post('backfill/:source')
   backfill(@Param('source') source: string, @Query('months') months?: string) {
     return this.ingestion.backfill(source, months ? Number(months) : 6);

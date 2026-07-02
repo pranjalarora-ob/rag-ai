@@ -36,8 +36,8 @@ SELECT
   p.name           AS project_name,
   p.company_name   AS project_company,
   p.city           AS project_city,
-  p.owner          AS project_owner
-
+  p.owner          AS project_owner,
+  p.code           AS project_code
 FROM bs_boqs t
 LEFT JOIN ls_lead_projects p ON p.id = t.project_id
 ${where}`;
@@ -78,6 +78,7 @@ export const boqSource: SourceDefinition = {
         boqId: row.id,
         projectId: row.project_id,
         projectName: row.project_name,
+        projectCode: row.project_code ? String(row.project_code) : null,
         companyName: row.project_company,
         city: row.project_city,
         owner: row.project_owner,

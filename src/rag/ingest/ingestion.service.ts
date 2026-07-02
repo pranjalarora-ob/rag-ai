@@ -132,7 +132,16 @@ export class IngestionService {
       { field: 'projectId', schema: 'keyword' },
       { field: 'accountId', schema: 'keyword' },
       { field: 'customerId', schema: 'keyword' },
+      { field: 'projectCode', schema: 'keyword' },
+      { field: 'parentId', schema: 'keyword' },
+      { field: 'code', schema: 'keyword' },
+      { field: 'status', schema: 'keyword' },
       { field: 'team[].userId', schema: 'keyword' },
+      { field: 'areaSft', schema: 'integer' },
+      { field: 'estimatedValue', schema: 'integer' },
+      { field: 'currentProjectValue', schema: 'integer' },
+      { field: 'closureValue', schema: 'integer' },
+      { field: 'cost', schema: 'integer' },
     ];
     for (const ix of indexes) {
       try {

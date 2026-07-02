@@ -211,9 +211,9 @@ function ChartView({ series }: { series: ChartSeries[] }) {
     if (v === 0) return '0'
     const abs = Math.abs(v)
     if (abs >= 1e12) return `${(v / 1e12).toFixed(1)}T`
-    if (abs >= 1e9)  return `${(v / 1e9).toFixed(1)}B`
-    if (abs >= 1e6)  return `${(v / 1e6).toFixed(1)}M`
-    if (abs >= 1e3)  return `${(v / 1e3).toFixed(1)}K`
+    if (abs >= 1e9) return `${(v / 1e9).toFixed(1)}B`
+    if (abs >= 1e6) return `${(v / 1e6).toFixed(1)}M`
+    if (abs >= 1e3) return `${(v / 1e3).toFixed(1)}K`
     return String(v)
   }
 
@@ -372,7 +372,24 @@ function DataTable({ headers, rows }: { headers: string[]; rows: string[][] }) {
   const fmtCell = (raw: string, kind: ColKind) =>
     kind === 'currency' ? fmtCurrency(raw)
       : kind === 'area' && cellNumber(raw) ? `${cellNumber(raw).toLocaleString('en-IN')} sqft`
-      : raw
+        : raw
+
+  const renderCellJSX = (val: string) => {
+    if (typeof val !== 'string') return val
+    const parts = val.split(/<br\s*\/?>/i)
+    if (parts.length > 1) {
+      return (
+        <span className="multiline-cell">
+          {parts.map((part, index) => (
+            <span key={index} className="cell-line" style={{ display: 'block', margin: '2px 0' }}>
+              {part}
+            </span>
+          ))}
+        </span>
+      )
+    }
+    return val
+  }
 
   const exportCSV = () => {
     const esc = (s: string) => `"${(s || '').replace(/"/g, '""')}"`
@@ -439,7 +456,7 @@ function DataTable({ headers, rows }: { headers: string[]; rows: string[][] }) {
                 <tr key={ri}>
                   {r.map((c, ci) => (
                     <td key={ci} className={kinds[ci] === 'currency' || kinds[ci] === 'area' ? 'num' : ''}>
-                      {fmtCell(c, kinds[ci])}
+                      {renderCellJSX(fmtCell(c, kinds[ci]))}
                     </td>
                   ))}
                 </tr>
@@ -454,7 +471,7 @@ function DataTable({ headers, rows }: { headers: string[]; rows: string[][] }) {
               {r.map((c, ci) => kinds[ci] === 'index' ? null : (
                 <div className="dt-card-row" key={ci}>
                   <span className="dt-card-key">{headers[ci]}</span>
-                  <span className={`dt-card-val ${kinds[ci] === 'currency' ? 'accent' : ''}`}>{fmtCell(c, kinds[ci])}</span>
+                  <span className={`dt-card-val ${kinds[ci] === 'currency' ? 'accent' : ''}`}>{renderCellJSX(fmtCell(c, kinds[ci]))}</span>
                 </div>
               ))}
             </div>
@@ -695,7 +712,7 @@ export default function App() {
               </svg>
             </button>
             <span className="header-icon">◈</span>
-            Project Intelligence
+            Jarvis Intelligence
           </div>
           <span className="header-badge">Online</span>
         </header>

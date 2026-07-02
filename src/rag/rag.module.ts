@@ -13,14 +13,12 @@ import { IngestionController } from './ingest/ingestion.controller';
 import { IngestionService } from './ingest/ingestion.service';
 import { PgService } from './ingest/pg.service';
 import { WatermarkStore } from './ingest/watermark.store';
-import { SemanticCacheService } from './semantic-cache.service';
 
 @Module({
   controllers: [RagController, IngestionController],
   providers: [
     QdrantService,
     OpenaiService,
-    SemanticCacheService,
     ClaudeService,
     GuardrailService,
     ProjectAnalyticsService,

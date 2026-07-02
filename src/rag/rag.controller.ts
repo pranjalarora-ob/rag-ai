@@ -1,5 +1,5 @@
 import {
-  Controller, Post, Body, Param, Get, Res, Patch,
+  Controller, Post, Body, Param, Get, Res, Patch, Query,
   BadRequestException, InternalServerErrorException,
 } from '@nestjs/common';
 import { ApiOperation, ApiProduces, ApiResponse, ApiTags } from '@nestjs/swagger';
@@ -15,7 +15,6 @@ import { ProjectAnalyticsService, AnalyticsQuery } from './project-analytics.ser
 import { PlannerService } from './planner.service';
 import { RerankService } from './rerank.service';
 import { ProjectAgentService } from './project-agent.service';
-import { SemanticCacheService } from './semantic-cache.service';
 import { SYSTEM_PROMPT, COLLECTION } from './constants';
 
 @ApiTags('RAG')
@@ -30,7 +29,6 @@ export class RagController {
     private readonly plannerService: PlannerService,
     private readonly rerankService: RerankService,
     private readonly projectAgentService: ProjectAgentService,
-    private readonly semanticCache: SemanticCacheService,
   ) { }
 
   // ============ Ingestion ============
@@ -105,24 +103,11 @@ export class RagController {
         throw new BadRequestException('Query violates company policy.');
       }
 
-      // Semantic cache: skip the full LLM+tool loop if a near-identical question
-      // was already answered for this customer (cosine similarity >= 0.92).
-      const cache = await this.semanticCache.check(body.question, body.customerId);
-      if (cache?.answer) {
-        res.setHeader('Content-Type', 'text/plain; charset=utf-8');
-        res.setHeader('Cache-Control', 'no-cache');
-        res.send(cache.answer);
-        return;
-      }
-
       await this.plannerService.runStream({
         question: body.question,
         customerId: body.customerId,
         history: body.history,
         res,
-        onAnswer: (answer: string) => {
-          this.semanticCache.save(body.question, cache?.embedding ?? [], answer, body.customerId).catch(() => {});
-        },
       });
     } catch (err) {
       console.error(err);
@@ -151,15 +136,6 @@ export class RagController {
       if (this.guardrailService.isPolicyViolation(question)) {
         throw new BadRequestException('Query violates company policy.');
       }
-
-      // ── Semantic cache check ──────────────────────────────────────────────────
-      const cache = await this.semanticCache.check(question, customerId);
-      if (cache.answer) {
-        res.setHeader('Content-Type', 'text/plain; charset=utf-8');
-        res.send(cache.answer);
-        return;
-      }
-      // ─────────────────────────────────────────────────────────────────────────
 
       // Structured LISTING queries ("all leads in Gurugram", "projects with area > 5000")
       // must use the filter/scroll path — NOT the aggregate analytics tool, which ignores
@@ -225,7 +201,12 @@ export class RagController {
       // A 6+ digit number is a project code ONLY when it's not the operand of an
       // area/value filter (in "area is 200000" the 200000 is the area, not a code).
       const codeMatch = !areaRange && !valueRange ? question.match(/\b(\d{6,})\b/) : null;
-      if (codeMatch) must.push({ key: 'projectCode', match: { value: Number(codeMatch[1]) } });
+      if (codeMatch) {
+        must.push({
+          key: 'projectCode',
+          match: { value: String(codeMatch[1]) }
+        });
+      }
 
       // "project" / "lead" in the question scopes to that DB type (both are docType:
       // project, split by the `type` column). Skipped for exact code lookups, which
@@ -306,8 +287,6 @@ export class RagController {
         }
         res.setHeader('Content-Type', 'text/plain; charset=utf-8');
         res.send(answer);
-        // Save to semantic cache after sending (non-blocking)
-        this.semanticCache.save(question, cache.embedding, answer, customerId).catch(() => {});
         return;
       }
 
@@ -317,6 +296,7 @@ export class RagController {
         limit: 100,
         filter: { must },
       });
+      console.log(`[Qdrant Search - Chat] Received ${hits?.length || 0} chunks for query: "${question}"`);
       const rawChunks = hits.sort((a: any, b: any) => b.score - a.score).map((r: any) => r.payload?.text as string);
       const rerankedChunks = await this.rerankService.rerank(question.trim(), rawChunks, 20);
       const context = await this.openaiService.truncateByTokens(rerankedChunks, 1000);
@@ -536,5 +516,20 @@ Question: "${question}"`;
       console.error('classifyQuery failed, defaulting to rag:', err);
     }
     return { type: 'rag' };
+  }
+
+  @Get('debug/points')
+  async debugPoints(@Query('code') code?: string) {
+    if (code) {
+      const must: any[] = [
+        {
+          key: 'projectCode',
+          match: { value: String(code) }
+        }
+      ];
+      return this.qdrantService.scrollAll(COLLECTION, { must });
+    }
+    const points = await this.qdrantService.scrollAll(COLLECTION, undefined, 5);
+    return points.slice(0, 5);
   }
 }
