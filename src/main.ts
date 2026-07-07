@@ -7,6 +7,15 @@ import { AppModule } from './app.module';
 async function bootstrap() {
   const app = await NestFactory.create(AppModule);
 
+  // Allow the workbench-app (and other first-party clients) to call the
+  // streaming endpoints from the browser across origins.
+  app.enableCors({
+    origin: true,
+    methods: ['GET', 'POST', 'PATCH', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization'],
+    credentials: true,
+  });
+
   app.useGlobalPipes(new ValidationPipe({ transform: true, whitelist: true }));
   app.use(json({ limit: '50mb' }));
 

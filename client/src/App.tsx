@@ -32,7 +32,7 @@ interface ChartPoint {
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 const CUSTOMER_ID = '7768d491-9dd4-4ac0-b85f-3ff68fc7d87e'
-const API_URL = '/rag/planner/stream'
+const API_URL = '/rag/agent-graph/stream'
 const STORAGE_KEY = 'pi_chats_v1'
 const MAX_SAVED_CHATS = 30
 // Source data occasionally carries corrupt values (e.g. 6e51). Treat any rupee

@@ -2,6 +2,10 @@ import { Injectable } from '@nestjs/common';
 import { QdrantService } from './qdrant.service';
 import { COLLECTION } from './constants';
 
+// Max rows returned for a listing query — keeps responses fast to stream and
+// cheap on tokens for broad filters like "all projects in Gurugram".
+const MAX_LIST_ROWS = 20;
+
 export type RangeOp = 'gt' | 'gte' | 'lt' | 'lte' | 'eq';
 export interface RangeCond {
   op: RangeOp;
@@ -92,7 +96,12 @@ export class ProjectQueryService {
       const key = spec.sortBy;
       items.sort((a, b) => ((Number(a[key]) || 0) - (Number(b[key]) || 0)) * dir);
     }
-    if (spec.limit) items = items.slice(0, spec.limit);
+
+    // Hard cap on rows returned: large listings ("all projects in Gurugram")
+    // otherwise produce a giant markdown table that is slow to stream and burns
+    // tokens. Never return more than MAX_LIST_ROWS; respect a smaller explicit limit.
+    const cap = Math.min(spec.limit ?? MAX_LIST_ROWS, MAX_LIST_ROWS);
+    items = items.slice(0, cap);
 
     let answer: string;
     if (!items.length) {
@@ -101,9 +110,10 @@ export class ProjectQueryService {
       const sortNote = spec.sortBy
         ? ` (sorted by ${spec.sortBy} ${spec.sortDir === 'asc' ? 'ascending' : 'descending'})`
         : '';
-      const header = spec.limit
-        ? `Top ${items.length} ${label} of ${total} matching${sortNote}:`
-        : `${total} matching ${label}${sortNote}:`;
+      const header =
+        items.length < total
+          ? `Showing ${items.length} of ${total} matching ${label}${sortNote}:`
+          : `${total} matching ${label}${sortNote}:`;
       const head = '| # | Code | Name | City | Zone | Owner | Area (sqft) | Estimated Value |\n|---|---|---|---|---|---|---|---|';
       const body = items
         .map(

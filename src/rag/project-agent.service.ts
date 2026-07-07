@@ -12,6 +12,9 @@ export interface AgentResult {
   answer: string;
   trace: Array<{ tool: string; args: any }>;
   steps: number;
+  // Structured rows behind the answer (present for deterministic queryProjects
+  // results) so callers can render a rich card instead of re-parsing prose.
+  rows?: any[];
 }
 
 /**
@@ -135,7 +138,7 @@ You are a project assistant. Use a tool to answer — never invent numbers or li
       // the LLM so the table/count is never truncated or reordered.
       if (call.function?.name === 'queryProjects') {
         const result = await this.projectQuery.execute(args, customerId);
-        return { answer: result.answer, trace, steps: step };
+        return { answer: result.answer, trace, steps: step, rows: result.rows };
       }
 
       // searchProjects feeds results back so the LLM can phrase a descriptive answer.

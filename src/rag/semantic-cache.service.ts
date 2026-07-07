@@ -29,12 +29,41 @@ export class SemanticCacheService {
     }
 
     if (hits.length && hits[0]?.payload?.answer) {
-      console.log(`[SemanticCache] HIT score=${hits[0].score?.toFixed(3)} q="${question.slice(0, 60)}"`);
-      return { answer: hits[0].payload.answer, embedding };
+      // Guard against semantic collisions on identifier-bearing queries. Questions
+      // that differ ONLY by a project code / id / filter value embed almost
+      // identically (cosine > 0.92), so a vector hit alone would happily return
+      // project 2640's answer for a question about project 2657. Require the
+      // significant numeric tokens (codes, ids, filter numbers — 3+ digits) to
+      // match exactly; otherwise treat it as a miss. Pure paraphrases with no
+      // numbers still benefit from the cache.
+      const cachedQuestion = String(hits[0].payload.question || '');
+      if (this.sameIdTokens(question, cachedQuestion)) {
+        console.log(`[SemanticCache] HIT score=${hits[0].score?.toFixed(3)} q="${question.slice(0, 60)}"`);
+        return { answer: hits[0].payload.answer, embedding };
+      }
+      console.log(
+        `[SemanticCache] SKIP (id mismatch) score=${hits[0].score?.toFixed(3)} ` +
+        `q="${question.slice(0, 60)}" cached="${cachedQuestion.slice(0, 60)}"`,
+      );
     }
 
     console.log(`[SemanticCache] MISS q="${question.slice(0, 60)}"`);
     return { answer: null, embedding };
+  }
+
+  // Significant numeric tokens (3+ digits) — project codes, ids, filter values.
+  // Small numbers like "top 5" / "top 10" are ignored so they don't over-segment.
+  private idTokens(q: string): Set<string> {
+    return new Set(q.match(/\d{3,}/g) || []);
+  }
+
+  // True when two questions carry the same set of significant numeric tokens.
+  private sameIdTokens(a: string, b: string): boolean {
+    const ta = this.idTokens(a);
+    const tb = this.idTokens(b);
+    if (ta.size !== tb.size) return false;
+    for (const t of ta) if (!tb.has(t)) return false;
+    return true;
   }
 
   async save(question: string, embedding: number[], answer: string, customerId: string): Promise<void> {

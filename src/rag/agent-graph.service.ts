@@ -42,7 +42,7 @@ export interface AgentGraphResult {
   cached: boolean;
 }
 
-type Route = 'analytics' | 'lookup' | 'search';
+type Route = 'analytics' | 'lookup' | 'search' | 'schedule';
 
 // Graph state. Kept at module scope so `GraphState` can be referenced in node
 // signatures without polymorphic-`this` type gymnastics.
@@ -184,6 +184,20 @@ export class AgentGraphService {
       r.answer !== 'No projects match that filter.' &&
       r.trace?.some((t) => t.tool === 'queryProjects' && t.args?.projectCode);
 
+    // Broad "tell me everything" questions about one project → return a structured
+    // card block the UI renders as a ProjectCard (deterministic, built from the DB
+    // payload — not LLM prose). Narrow questions ("who is the owner?") skip the card
+    // and get a focused text answer instead.
+    const broadIntent =
+      /\b(info|information|details?|tell me about|about|summary|overview|everything|show|profile)\b/i.test(
+        state.question,
+      );
+    const record = r.rows?.[0];
+    if (singleRecord && broadIntent && record) {
+      const block = this.buildProjectCardBlock(record);
+      if (block) return { answer: block, trace: r.trace };
+    }
+
     if (singleRecord) {
       const focused = await this.openai.openRouterGenerate(
         `${SYSTEM_PROMPT}
@@ -243,6 +257,46 @@ QUESTION: ${state.question}`,
     };
   };
 
+  // schedule: project workflow / timeline. Deterministically pulls the project's
+  // flow phases (docType 'project-flow-phase') and returns a structured block the
+  // UI renders as a stepper. Not LLM-phrased — dates/statuses come straight from data.
+  private scheduleAgentNode = async (state: GraphState) => {
+    const code = this.extractProjectCode(state.question, state.history);
+    if (!code) {
+      return { answer: 'Which project would you like the schedule for? Please include its project code.' };
+    }
+
+    const must = [
+      { key: 'customerId', match: { value: state.customerId } },
+      { key: 'docType', match: { value: 'project-flow-phase' } },
+      { key: 'projectCode', match: { value: code } },
+    ];
+    const points = await this.qdrant.scrollAll(COLLECTION, { must });
+
+    const seen = new Set<string>();
+    const phases: any[] = [];
+    for (const p of points) {
+      const pl: any = p.payload || {};
+      const id = pl.phaseId || pl.original_id;
+      if (id && seen.has(id)) continue;
+      if (id) seen.add(id);
+      phases.push(pl);
+    }
+    if (!phases.length) {
+      return {
+        answer: `No project schedule found for project ${code}.`,
+        trace: [{ tool: 'projectSchedule', args: { projectCode: code }, result: [] }],
+      };
+    }
+    phases.sort((a, b) => (Number(a.sequence) || 0) - (Number(b.sequence) || 0));
+
+    const name = phases[0].projectName || `Project ${code}`;
+    return {
+      answer: this.buildScheduleBlock(name, code, phases),
+      trace: [{ tool: 'projectSchedule', args: { projectCode: code }, result: phases.length }],
+    };
+  };
+
   private cacheSaveNode = async (state: GraphState) => {
     if (!state.cached && !state.blocked && state.answer && state.cacheEmbedding?.length) {
       this.semanticCache
@@ -252,11 +306,103 @@ QUESTION: ${state.question}`,
     return {};
   };
 
+  // Build a fenced ```project-card block from a project payload. The UI parses this
+  // JSON and renders a rich ProjectCard; other clients just see a JSON code block.
+  private buildProjectCardBlock(pl: any): string | null {
+    if (!pl) return null;
+    const name =
+      pl.projectName || (pl.companyName || '').trim() || String(pl.projectCode || 'Project');
+    const num = (x: any) => {
+      const n = Number(x);
+      return Number.isFinite(n) && n > 0 ? n : undefined;
+    };
+    const card = {
+      code: pl.projectCode != null ? String(pl.projectCode) : undefined,
+      name,
+      type: pl.type || undefined,
+      status: pl.projectStatus || pl.leadStatus || undefined,
+      leadStatus: pl.leadStatus || undefined,
+      stage: [pl.stage, pl.subStage].filter(Boolean).join(' / ') || undefined,
+      owner: pl.owner || undefined,
+      city: [pl.city, pl.state].filter(Boolean).join(', ') || undefined,
+      zone: pl.zone || undefined,
+      area: num(pl.areaSft),
+      scope: pl.scope || undefined,
+      channel: pl.channel || undefined,
+      priority: pl.priority != null ? String(pl.priority) : undefined,
+      estimatedValue: num(pl.estimatedValue),
+      currentProjectValue: num(pl.currentProjectValue),
+      closureValue: num(pl.closureValue),
+      customer: pl.customerInfo?.name
+        ? {
+            name: pl.customerInfo.name,
+            email: pl.customerInfo.email || undefined,
+            mobile: pl.customerInfo.mobile || undefined,
+          }
+        : undefined,
+      team: Array.isArray(pl.team)
+        ? pl.team
+            .map((m: any) => m.role || m.pocRole)
+            .filter(Boolean)
+            .slice(0, 6)
+        : undefined,
+      projectId: pl.projectId || undefined,
+    };
+    // Drop undefined keys so the payload stays compact.
+    const clean = JSON.parse(JSON.stringify(card));
+    return '```project-card\n' + JSON.stringify(clean) + '\n```';
+  }
+
+  // Pull a project code (6+ digit number) from the question, or fall back to the
+  // most recent code mentioned earlier in the conversation — so a bare follow-up
+  // like "Project schedule" resolves against the project just discussed.
+  private extractProjectCode(question: string, history?: Array<{ role: string; content: string }>): string | null {
+    const m = question.match(/\b(\d{6,})\b/);
+    if (m) return m[1];
+    for (const h of [...(history || [])].reverse()) {
+      const hm = String(h?.content || '').match(/\b(\d{6,})\b/);
+      if (hm) return hm[1];
+    }
+    return null;
+  }
+
+  // Build a fenced ```project-schedule block from the project's flow phases. The UI
+  // parses this JSON and renders a stepper (phases + nested milestones with status
+  // and dates); other clients just see a JSON code block.
+  private buildScheduleBlock(name: string, code: string, phases: any[]): string {
+    const clean = {
+      code,
+      name,
+      phases: phases.map((p) => ({
+        name: p.name,
+        code: p.code || undefined,
+        status: p.status || null,
+        sequence: p.sequence,
+        startDate: p.startDate || null,
+        endDate: p.endDate || null,
+        milestones: (Array.isArray(p.milestones) ? p.milestones : [])
+          .slice()
+          .sort((a: any, b: any) => (Number(a.sequence) || 0) - (Number(b.sequence) || 0))
+          .map((m: any) => ({
+            name: m.name,
+            status: m.status || null,
+            sequence: m.sequence,
+            startDate: m.startDate || null,
+            endDate: m.endDate || null,
+          })),
+      })),
+    };
+    return '```project-schedule\n' + JSON.stringify(clean) + '\n```';
+  }
+
   // ============ Routing helpers ============
 
   private async classify(question: string): Promise<Route> {
     // Deterministic disambiguation first — a specific field filter can't be an aggregate.
     const q = question.toLowerCase();
+    // Schedule/workflow intent → the project-flow stepper. Wins over other routes.
+    const scheduleIntent = /\b(schedule|timeline|road ?map|workflow|project flow|phases?|milestones?)\b/.test(q);
+    if (scheduleIntent) return 'schedule';
     const descriptive = /\b(tell me about|who is|who are|design manager|notes|describe|context|details about)\b/.test(q);
     const fieldFilter = /\b(in|from|at)\s+[a-z]|area|sqft|sq ft|estimated value|owner|zone|project code|leads?\b|projects?\b/.test(q);
     const aggregate = /\b(total|sum|average|avg|count|how many|highest|lowest|top\s*\d+|rank|most|least|combined|per\s+\w+|group)\b/.test(q);
@@ -301,6 +447,7 @@ Question: "${question}"`,
       .addNode('analytics', this.analyticsAgentNode)
       .addNode('lookup', this.lookupAgentNode)
       .addNode('search', this.searchAgentNode)
+      .addNode('schedule', this.scheduleAgentNode)
       .addNode('cacheSave', this.cacheSaveNode)
       .addEdge(START, 'guardrail')
       .addConditionalEdges('guardrail', (s) => (s.blocked ? END : 'cacheCheck'), {
@@ -315,10 +462,12 @@ Question: "${question}"`,
         analytics: 'analytics',
         lookup: 'lookup',
         search: 'search',
+        schedule: 'schedule',
       })
       .addEdge('analytics', 'cacheSave')
       .addEdge('lookup', 'cacheSave')
       .addEdge('search', 'cacheSave')
+      .addEdge('schedule', 'cacheSave')
       .addEdge('cacheSave', END);
 
     return workflow.compile({ checkpointer: new MemorySaver() });
