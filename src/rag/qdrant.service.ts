@@ -130,6 +130,22 @@ export class QdrantService {
     }
   }
 
+  async deletePoint(collection: string, id: string | number) {
+    try {
+      return await this.client.delete(collection, { points: [id] });
+    } catch (error: any) {
+      if (error?.status === 404 || /not found|doesn't exist/i.test(error?.message || '')) {
+        return { result: 'not_found' };
+      }
+      console.error('Qdrant delete point error:', {
+        status: error?.status,
+        message: error?.message,
+        data: error?.data,
+      });
+      throw error;
+    }
+  }
+
   clearCollection(collection: string) {
     return axios.post(
       `${this.QDRANT_URL}/collections/${collection}/points/delete?wait=true`,

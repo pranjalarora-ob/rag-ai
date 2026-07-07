@@ -34,5 +34,6 @@ import { SemanticCacheService } from './semantic-cache.service';
     PgService,
     WatermarkStore,
   ],
+  exports: [IngestionService, QdrantService, OpenaiService],
 })
 export class RagModule {}
