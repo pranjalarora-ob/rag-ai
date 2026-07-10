@@ -129,9 +129,18 @@ export class IngestionService {
     await this.qdrant.createCollection(collection);
     const indexes: { field: string; schema: any }[] = [
       { field: 'docType', schema: 'keyword' },
+      { field: 'type', schema: 'keyword' },
+      { field: 'active', schema: 'bool' },
       { field: 'projectId', schema: 'keyword' },
       { field: 'accountId', schema: 'keyword' },
       { field: 'customerId', schema: 'keyword' },
+      { field: 'projectCode', schema: 'keyword' },
+      { field: 'projectCode', schema: 'integer' },
+      { field: 'city', schema: 'keyword' },
+      { field: 'stage', schema: 'keyword' },
+      { field: 'owner', schema: 'keyword' },
+      { field: 'areaSft', schema: 'float' },
+      { field: 'estimatedValue', schema: 'float' },
       { field: 'team[].userId', schema: 'keyword' },
     ];
     for (const ix of indexes) {

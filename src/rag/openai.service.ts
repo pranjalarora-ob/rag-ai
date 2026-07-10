@@ -11,6 +11,7 @@ import { ChatCompletionRequestMessage } from './dto/openai.dto';
 export class OpenaiService {
   private readonly OPENROUTER_API_KEY: string;
   private readonly OPENROUTER_MODEL: string;
+  private readonly OPENROUTER_MAX_TOKENS: number;
   private readonly EMBEDDING_MODEL: string;
 
   private readonly OPENROUTER_EMBEDDINGS_URL = 'https://openrouter.ai/api/v1/embeddings';
@@ -19,6 +20,7 @@ export class OpenaiService {
   constructor(private readonly configService: ConfigService) {
     this.OPENROUTER_API_KEY = this.configService.get('OPEN_ROUTER_API_KEY') || '';
     this.OPENROUTER_MODEL = this.configService.get('OPEN_ROUTER_MODEL') || 'openai/gpt-4o-mini';
+    this.OPENROUTER_MAX_TOKENS = Number(this.configService.get('OPEN_ROUTER_MAX_TOKENS')) || 800;
     this.EMBEDDING_MODEL = this.configService.get('EMBEDDING_MODEL') || 'openai/text-embedding-3-small';
   }
 
@@ -93,7 +95,13 @@ export class OpenaiService {
       try {
         response = await axios.post(
           this.OPENROUTER_URL,
-          { model: this.OPENROUTER_MODEL, messages, temperature: 0.2, stream: true },
+          {
+            model: this.OPENROUTER_MODEL,
+            messages,
+            temperature: 0.2,
+            max_tokens: this.OPENROUTER_MAX_TOKENS,
+            stream: true,
+          },
           { responseType: 'stream', headers: this.openRouterHeaders },
         );
       } catch (err: any) {
@@ -151,7 +159,12 @@ export class OpenaiService {
     try {
       const res = await axios.post(
         this.OPENROUTER_URL,
-        { model: this.OPENROUTER_MODEL, messages: [{ role: 'user', content: prompt }], temperature },
+        {
+          model: this.OPENROUTER_MODEL,
+          messages: [{ role: 'user', content: prompt }],
+          temperature,
+          max_tokens: this.OPENROUTER_MAX_TOKENS,
+        },
         { headers: this.openRouterHeaders },
       );
       return res.data?.choices?.[0]?.message?.content || '';
@@ -165,7 +178,14 @@ export class OpenaiService {
   async openRouterToolTurn(messages: any[], tools: any[]): Promise<any> {
     const res = await axios.post(
       this.OPENROUTER_URL,
-      { model: this.OPENROUTER_MODEL, messages, tools, tool_choice: 'auto', temperature: 0.2 },
+      {
+        model: this.OPENROUTER_MODEL,
+        messages,
+        tools,
+        tool_choice: 'auto',
+        temperature: 0.2,
+        max_tokens: this.OPENROUTER_MAX_TOKENS,
+      },
       { headers: this.openRouterHeaders },
     );
     return res.data?.choices?.[0]?.message;

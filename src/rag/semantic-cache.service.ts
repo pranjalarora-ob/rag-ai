@@ -3,14 +3,14 @@ import { QdrantService } from './qdrant.service';
 import { OpenaiService } from './openai.service';
 
 const CACHE_COLLECTION = 'semantic_cache';
-const SCORE_THRESHOLD = 0.92;
+const SCORE_THRESHOLD = 0.95;
 
 @Injectable()
 export class SemanticCacheService {
   constructor(
     private readonly qdrantService: QdrantService,
     private readonly openaiService: OpenaiService,
-  ) {}
+  ) { }
 
   async check(question: string, customerId: string): Promise<{ answer: string; embedding: number[] } | null> {
     const embedding = await this.openaiService.generateEmbedding(question.trim());

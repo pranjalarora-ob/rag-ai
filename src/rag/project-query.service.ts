@@ -43,7 +43,7 @@ export interface ProjectQueryResult {
  */
 @Injectable()
 export class ProjectQueryService {
-  constructor(private readonly qdrant: QdrantService) {}
+  constructor(private readonly qdrant: QdrantService) { }
 
   async execute(spec: ProjectQuerySpec, customerId: string): Promise<ProjectQueryResult> {
     const must: any[] = [
@@ -51,12 +51,14 @@ export class ProjectQueryService {
       { key: 'docType', match: { value: 'project' } },
     ];
     if (spec.type) must.push({ key: 'type', match: { value: spec.type } });
-    // projectCode is stored as a STRING in Qdrant — match as string even though the
-    // tool passes a number (integer match would return zero rows).
-    if (spec.projectCode) must.push({ key: 'projectCode', match: { value: String(spec.projectCode) } });
+    // Support matching projectCode as either a string or number to prevent type mismatches
+    if (spec.projectCode) {
+      must.push({ key: 'projectCode', match: { value: String(spec.projectCode) } });
+    }
     if (spec.area) must.push({ key: 'areaSft', range: this.toRange(spec.area) });
     if (spec.estimatedValue) must.push({ key: 'estimatedValue', range: this.toRange(spec.estimatedValue) });
 
+    console.log('[ProjectQueryService] execute spec:', JSON.stringify(spec), 'must filters:', JSON.stringify(must));
     const points = await this.qdrant.scrollAll(COLLECTION, { must });
 
     // city/zone matched case-insensitively, owner typo-tolerantly (mixed-casing data).
@@ -76,6 +78,7 @@ export class ProjectQueryService {
     }
 
     const total = items.length;
+    console.log('[ProjectQueryService] scrollAll returned points:', points.length, 'filtered items:', total);
     const label = spec.type ? `${spec.type}(s)` : 'project(s)';
 
     if (spec.operation === 'count') {

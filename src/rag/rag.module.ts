@@ -1,4 +1,5 @@
 import { Module } from '@nestjs/common';
+import { ChatModule } from '../chat/chat.module';
 import { RagController } from './rag.controller';
 import { QdrantService } from './qdrant.service';
 import { OpenaiService } from './openai.service';
@@ -17,6 +18,7 @@ import { WatermarkStore } from './ingest/watermark.store';
 import { SemanticCacheService } from './semantic-cache.service';
 
 @Module({
+  imports: [ChatModule],
   controllers: [RagController, IngestionController],
   providers: [
     QdrantService,

@@ -49,10 +49,11 @@ SELECT
    LIMIT 1)                  AS mis,
 
   COALESCE((SELECT json_agg(json_build_object(
-     'userId', ar.user_id, 'role', ar.role, 'pocRole', ar.poc_role))
+     'userId', ar.user_id, 'name', u.name, 'role', ar.role, 'pocRole', ar.poc_role))
    FROM ls_assigned_resources ar
+   LEFT JOIN us_users u ON u.id = ar.user_id
    WHERE ar.project_id = t.id AND ar."deletedAt" IS NULL), '[]') AS team
-
+ 
 FROM ls_lead_projects t
 ${where}`;
 
@@ -62,6 +63,28 @@ const num = (x: any) => {
 };
 const stripHtml = (s: any) =>
   String(s || '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+
+const LEAD_ZONES: Record<string, string> = {
+  bangalore: 'South',
+  bengaluru: 'South',
+  kolkata: 'East',
+  mumbai: 'West',
+  gurgaon: 'North',
+  gurugram: 'North',
+  unassigned: 'Unassigned',
+};
+
+function getZone(city: string, dbZone: string): string {
+  const c = String(city || '').trim().toLowerCase();
+  if (LEAD_ZONES[c]) return LEAD_ZONES[c];
+  for (const [key, val] of Object.entries(LEAD_ZONES)) {
+    if (key !== 'unassigned' && c.includes(key)) return val;
+  }
+  if (dbZone && dbZone.trim().toLowerCase() !== 'unassigned') {
+    return dbZone;
+  }
+  return 'Unassigned';
+}
 
 export const projectSource: SourceDefinition = {
   name: 'project',
@@ -77,15 +100,20 @@ export const projectSource: SourceDefinition = {
     const com = row.commercial || {};
     const mis = row.mis || {};
     const team: any[] = Array.isArray(row.team) ? row.team : [];
+    const zone = getZone(row.city, row.zone);
+    const isLead = row.type ? String(row.type).toLowerCase() === 'lead' : false;
+    const status = isLead ? row.lead_status : row.project_status;
+    const active = status === 'InProgress';
 
     const lines = [
       `Project ${row.code ?? ''} (${(row.company_name || '').trim()}).`,
       `Type: ${row.lead_type}. Lead status: ${row.lead_status}. Project status: ${row.project_status}.`,
       `Customer: ${cust.name || cust.customerName || ''} (${cust.emailId || cust.email || ''}, ${cust.mobileNumber || cust.mobile_number || ''}).`,
-      `City: ${row.city}, ${row.state}, zone ${row.zone}. Area: ${row.area_sft} sqft. Nature of business: ${row.nature_of_business || ''}.`,
+      `City: ${row.city}, ${row.state}, zone ${zone}. Area: ${row.area_sft} sqft. Nature of business: ${row.nature_of_business || ''}.`,
       `Stage: ${row.stage} / ${row.sub_stage}. Priority: ${row.priority}. Owner: ${row.owner}. Scope: ${row.scope}. Channel: ${row.channel}.`,
       `Estimated value: ${row.estimated_value}. Current project value: ${row.current_project_value}. Closure value: ${row.closure_value}.`,
-      `Team: ${team.map((m) => `${m.userId} (${m.role || m.pocRole || ''})`).join(', ')}.`,
+      `Team: ${team.map((m) => `${m.name || m.userId} (${m.role || m.pocRole || ''})`).join(', ')}.`,
+      `Created at: ${row.created_at}. Active: ${active ? 'Yes' : 'No'}.`,
       `Notes: ${stripHtml(row.descr)}.`,
     ];
     if (com && Object.keys(com).length) {
@@ -105,10 +133,11 @@ export const projectSource: SourceDefinition = {
       metadata: {
         docType: 'project',
         type: row.type ? String(row.type).toLowerCase() : null, // DB type LEAD|PROJECT -> "lead"|"project"
+        active,
         projectId: row.id,
         accountId: row.account_id,
         customerId: row.account_id, // keeps the existing chat/analytics customerId filter working
-        projectCode: row.code,
+        projectCode: row.code != null ? String(row.code) : undefined,
         projectName: row.name,
         companyName: row.company_name,
         customerInfo: {
@@ -118,7 +147,7 @@ export const projectSource: SourceDefinition = {
         },
         city: row.city,
         state: row.state,
-        zone: row.zone,
+        zone: zone,
         areaSft: num(row.area_sft),
         channel: row.channel,
         stage: row.stage,
@@ -130,6 +159,7 @@ export const projectSource: SourceDefinition = {
         currentProjectValue: num(row.current_project_value),
         closureValue: num(row.closure_value),
         team, // [{ userId, role, pocRole }] — filterable for "where <person> is a team member"
+        createdAt: row.created_at,
         updatedAt: row.updated_at,
       },
     };

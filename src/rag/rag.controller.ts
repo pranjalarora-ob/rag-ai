@@ -18,6 +18,7 @@ import { ProjectAgentService } from './project-agent.service';
 import { AgentGraphService } from './agent-graph.service';
 import { SemanticCacheService } from './semantic-cache.service';
 import { SYSTEM_PROMPT, COLLECTION } from './constants';
+import { ChatService } from '../chat/chat.service';
 
 @ApiTags('RAG')
 @Controller('rag')
@@ -33,6 +34,7 @@ export class RagController {
     private readonly projectAgentService: ProjectAgentService,
     private readonly agentGraphService: AgentGraphService,
     private readonly semanticCache: SemanticCacheService,
+    private readonly chatService: ChatService,
   ) { }
 
   // ============ Ingestion ============
@@ -123,7 +125,7 @@ export class RagController {
         history: body.history,
         res,
         onAnswer: (answer: string) => {
-          this.semanticCache.save(body.question, cache?.embedding ?? [], answer, body.customerId).catch(() => {});
+          this.semanticCache.save(body.question, cache?.embedding ?? [], answer, body.customerId).catch(() => { });
         },
       });
     } catch (err) {
@@ -149,6 +151,7 @@ export class RagController {
     return this.agentGraphService.run({
       question: body.question,
       customerId: body.customerId,
+      sessionId: body.sessionId,
       history: body.history,
     });
   }
@@ -162,6 +165,7 @@ export class RagController {
       await this.agentGraphService.runStream({
         question: body.question,
         customerId: body.customerId,
+        sessionId: body.sessionId,
         history: body.history,
         res,
       });
@@ -259,14 +263,16 @@ export class RagController {
       // A 6+ digit number is a project code ONLY when it's not the operand of an
       // area/value filter (in "area is 200000" the 200000 is the area, not a code).
       const codeMatch = !areaRange && !valueRange ? question.match(/\b(\d{6,})\b/) : null;
-      if (codeMatch) must.push({ key: 'projectCode', match: { value: Number(codeMatch[1]) } });
+      if (codeMatch) {
+        must.push({ key: 'projectCode', match: { value: String(codeMatch[1]) } });
+      }
 
       // "project" / "lead" in the question scopes to that DB type (both are docType:
       // project, split by the `type` column). Skipped for exact code lookups, which
       // resolve to one record and need the full document detail.
       const typeFilter = codeMatch ? null : this.parseType(question);
 
-      if (areaRange || valueRange || city || owner || zone || typeFilter) {
+      if (areaRange || valueRange || city || owner || zone || typeFilter || codeMatch) {
         must.push({ key: 'docType', match: { value: 'project' } });
         if (typeFilter) must.push({ key: 'type', match: { value: typeFilter } });
         if (areaRange) must.push({ key: 'areaSft', range: areaRange });
@@ -341,7 +347,7 @@ export class RagController {
         res.setHeader('Content-Type', 'text/plain; charset=utf-8');
         res.send(answer);
         // Save to semantic cache after sending (non-blocking)
-        this.semanticCache.save(question, cache.embedding, answer, customerId).catch(() => {});
+        this.semanticCache.save(question, cache.embedding, answer, customerId).catch(() => { });
         return;
       }
 

@@ -15,6 +15,7 @@ import { SemanticCacheService } from './semantic-cache.service';
 import { PlannerService } from './planner.service';
 import { ProjectAgentService } from './project-agent.service';
 import { SYSTEM_PROMPT, COLLECTION } from './constants';
+import { ChatService } from '../chat/chat.service';
 
 /**
  * LangGraph multi-agent orchestrator.
@@ -40,6 +41,7 @@ export interface AgentGraphResult {
   route: string;
   trace: Array<{ tool: string; args: any; result?: any }>;
   cached: boolean;
+  sessionId?: string;
 }
 
 type Route = 'analytics' | 'lookup' | 'search' | 'schedule';
@@ -71,6 +73,7 @@ export class AgentGraphService {
     private readonly semanticCache: SemanticCacheService,
     private readonly planner: PlannerService,
     private readonly projectAgent: ProjectAgentService,
+    private readonly chatService: ChatService,
   ) {
     this.graph = this.buildGraph();
   }
@@ -81,8 +84,17 @@ export class AgentGraphService {
   async run(params: {
     question: string;
     customerId: string;
+    sessionId?: string;
     history?: Array<{ role: string; content: string }>;
   }): Promise<AgentGraphResult> {
+    let activeSessionId = params.sessionId;
+    if (!activeSessionId) {
+      const session = await this.chatService.createSession(params.customerId, params.question);
+      activeSessionId = (session as any)._id.toString();
+    }
+    // Save user question
+    await this.chatService.addMessage(activeSessionId, 'user', params.question);
+
     const final = await this.graph.invoke(
       {
         question: params.question,
@@ -92,11 +104,16 @@ export class AgentGraphService {
       { configurable: { thread_id: crypto.randomUUID() } },
     );
 
+    const answer = final.answer ?? '';
+    // Save assistant answer
+    await this.chatService.addMessage(activeSessionId, 'assistant', answer);
+
     return {
-      answer: final.answer ?? '',
+      answer,
       route: final.route ?? 'analytics',
       trace: final.trace ?? [],
       cached: !!final.cached,
+      sessionId: activeSessionId,
     };
   }
 
@@ -108,14 +125,18 @@ export class AgentGraphService {
   async runStream(params: {
     question: string;
     customerId: string;
+    sessionId?: string;
     history?: Array<{ role: string; content: string }>;
     res: Response;
     onAnswer?: (answer: string) => void;
   }): Promise<void> {
     const { res, onAnswer } = params;
-    const { answer } = await this.run(params);
+    const { answer, sessionId } = await this.run(params);
     onAnswer?.(answer);
 
+    if (sessionId) {
+      res.setHeader('x-session-id', sessionId);
+    }
     res.setHeader('Content-Type', 'text/plain; charset=utf-8');
     res.setHeader('Cache-Control', 'no-cache');
     res.flushHeaders?.();
@@ -266,11 +287,13 @@ QUESTION: ${state.question}`,
       return { answer: 'Which project would you like the schedule for? Please include its project code.' };
     }
 
-    const must = [
+    const must: any[] = [
       { key: 'customerId', match: { value: state.customerId } },
       { key: 'docType', match: { value: 'project-flow-phase' } },
-      { key: 'projectCode', match: { value: code } },
     ];
+    if (code) {
+      must.push({ key: 'projectCode', match: { value: String(code) } });
+    }
     const points = await this.qdrant.scrollAll(COLLECTION, { must });
 
     const seen = new Set<string>();
@@ -301,7 +324,7 @@ QUESTION: ${state.question}`,
     if (!state.cached && !state.blocked && state.answer && state.cacheEmbedding?.length) {
       this.semanticCache
         .save(state.question, state.cacheEmbedding, state.answer, state.customerId)
-        .catch(() => {});
+        .catch(() => { });
     }
     return {};
   };
@@ -335,16 +358,20 @@ QUESTION: ${state.question}`,
       closureValue: num(pl.closureValue),
       customer: pl.customerInfo?.name
         ? {
-            name: pl.customerInfo.name,
-            email: pl.customerInfo.email || undefined,
-            mobile: pl.customerInfo.mobile || undefined,
-          }
+          name: pl.customerInfo.name,
+          email: pl.customerInfo.email || undefined,
+          mobile: pl.customerInfo.mobile || undefined,
+        }
         : undefined,
       team: Array.isArray(pl.team)
         ? pl.team
-            .map((m: any) => m.role || m.pocRole)
-            .filter(Boolean)
-            .slice(0, 6)
+          .map((m: any) => {
+            const name = m.name || '';
+            const role = m.role || m.pocRole || '';
+            return name && role ? `${name} (${role})` : (name || role);
+          })
+          .filter(Boolean)
+          .slice(0, 6)
         : undefined,
       projectId: pl.projectId || undefined,
     };
@@ -403,6 +430,8 @@ QUESTION: ${state.question}`,
     // Schedule/workflow intent → the project-flow stepper. Wins over other routes.
     const scheduleIntent = /\b(schedule|timeline|road ?map|workflow|project flow|phases?|milestones?)\b/.test(q);
     if (scheduleIntent) return 'schedule';
+    // If the question contains a 6+ digit project code, bypass the LLM and route directly to lookup!
+    if (/\b(\d{6,})\b/.test(q)) return 'lookup';
     const descriptive = /\b(tell me about|who is|who are|design manager|notes|describe|context|details about)\b/.test(q);
     const fieldFilter = /\b(in|from|at)\s+[a-z]|area|sqft|sq ft|estimated value|owner|zone|project code|leads?\b|projects?\b/.test(q);
     const aggregate = /\b(total|sum|average|avg|count|how many|highest|lowest|top\s*\d+|rank|most|least|combined|per\s+\w+|group)\b/.test(q);
@@ -424,8 +453,8 @@ Question: "${question}"`,
 
     const llmRoute: Route | null =
       raw.includes('analytics') ? 'analytics' :
-      raw.includes('lookup') ? 'lookup' :
-      raw.includes('search') ? 'search' : null;
+        raw.includes('lookup') ? 'lookup' :
+          raw.includes('search') ? 'search' : null;
 
     // Trust the LLM, but let strong deterministic signals override obvious misroutes.
     if (descriptive && !aggregate) return 'search';

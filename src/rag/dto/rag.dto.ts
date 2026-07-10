@@ -45,6 +45,11 @@ export class ChatDto {
   @ApiProperty({ description: 'Customer identifier' })
   @IsString()
   customerId: string;
+
+  @ApiProperty({ description: 'Active MongoDB Chat Session ID', required: false })
+  @IsOptional()
+  @IsString()
+  sessionId?: string;
 }
 
 export class ChatHistoryMessageDto {
@@ -65,6 +70,11 @@ export class PlannerDto {
   @ApiProperty({ description: 'Customer identifier' })
   @IsString()
   customerId: string;
+
+  @ApiProperty({ description: 'Active MongoDB Chat Session ID', required: false })
+  @IsOptional()
+  @IsString()
+  sessionId?: string;
 
   @ApiProperty({ description: 'Prior conversation turns for context', type: [ChatHistoryMessageDto], required: false })
   @IsOptional()

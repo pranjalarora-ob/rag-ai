@@ -116,25 +116,32 @@ export class QdrantService {
 
   async addIndex(collection: string, addSchemaIndexDto: AddSchemaIndexDto) {
     try {
-      return await this.client.createPayloadIndex(collection, {
-        field_name: addSchemaIndexDto.field,
-        field_schema: addSchemaIndexDto.schema,
-      });
+      console.log('[QdrantService] addIndex call:', { collection, addSchemaIndexDto });
+      const res = await axios.put(
+        `${this.QDRANT_URL}/collections/${collection}/index?wait=true`,
+        {
+          field_name: addSchemaIndexDto.field,
+          field_schema: addSchemaIndexDto.schema,
+        },
+        { headers: this.QDRANT_API_KEY ? { 'api-key': this.QDRANT_API_KEY } : {} },
+      );
+      return res.data;
     } catch (error: any) {
       console.error('Qdrant addIndex error details:', {
-        status: error?.status,
-        message: error?.message,
-        data: error?.data,
+        status: error?.response?.status || error?.status,
+        message: error?.response?.statusText || error?.message,
+        data: error?.response?.data || error?.data,
       });
       throw error;
     }
   }
 
-  clearCollection(collection: string) {
-    return axios.post(
+  async clearCollection(collection: string) {
+    const res = await axios.post(
       `${this.QDRANT_URL}/collections/${collection}/points/delete?wait=true`,
       { filter: {} },
       { headers: this.QDRANT_API_KEY ? { 'api-key': this.QDRANT_API_KEY } : {} },
     );
+    return res.data;
   }
 }
