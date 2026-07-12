@@ -1,6 +1,7 @@
 import { Injectable } from '@nestjs/common';
 import { QdrantService } from './qdrant.service';
 import { COLLECTION } from './constants';
+import { toRegion } from './region.util';
 
 type Metric = 'estimatedValue' | 'boqValue' | 'area';
 
@@ -20,10 +21,11 @@ export interface AnalyticsQuery {
   projectCodes?: string[];
   teamMember?: string;
   role?: string;
-  groupBy?: 'stage' | 'subStage' | 'city' | 'state' | 'zone' | 'owner' | 'channel' | 'projectStatus';
+  groupBy?: 'stage' | 'subStage' | 'city' | 'state' | 'zone' | 'region' | 'owner' | 'channel' | 'projectStatus';
   city?: string;
   state?: string;
   zone?: string;
+  region?: string; // normalized region (North/South/East/West/Unassigned)
   stage?: string;
   subStage?: string;
   owner?: string;
@@ -37,6 +39,16 @@ export interface AnalyticsQuery {
   minArea?: number;
   maxArea?: number;
   equalsArea?: number;
+  // ---- lead/project lifecycle + date dimension ----
+  type?: 'lead' | 'project'; // filter by record type (lead vs converted project)
+  active?: boolean; // only active (or inactive) projects
+  ownerMissing?: boolean; // only records with no assigned owner
+  dateField?: 'createdAt' | 'updatedAt'; // which date the date filters/buckets use (default createdAt)
+  lastNDays?: number; // dateField within the last N days
+  lastNMonths?: number; // dateField within the last N months
+  createdAfter?: string; // ISO date — dateField on/after
+  createdBefore?: string; // ISO date — dateField on/before
+  bucketBy?: 'month' | 'quarter'; // add a timeline breakdown grouped by month/quarter of dateField
 }
 
 /**
@@ -131,6 +143,11 @@ export class ProjectAnalyticsService {
     eq('city', query.city);
     eq('state', query.state);
     includes('zone', query.zone);
+    // Region filter: normalize each doc's zone to a canonical region and match.
+    if (query.region) {
+      const r = query.region.trim().toLowerCase();
+      docs = docs.filter((p) => toRegion(p.zone).toLowerCase() === r);
+    }
     eq('stage', query.stage);
     eq('subStage', query.subStage);
     eq('owner', query.owner);
@@ -173,6 +190,43 @@ export class ProjectAnalyticsService {
       docs = docs.filter((p) => this.matchesTeam(p, query.teamMember!, query.role));
     }
 
+    // ---- lead/project lifecycle filters ----
+    if (query.type) {
+      const t = query.type.toLowerCase();
+      docs = docs.filter((p) => String(p.type || '').toLowerCase() === t);
+    }
+    if (query.active !== undefined) {
+      docs = docs.filter((p) => Boolean(p.active) === query.active);
+    }
+    if (query.ownerMissing) {
+      docs = docs.filter((p) => !String(p.owner || '').trim());
+    }
+
+    // ---- date dimension: filter by a date field (default createdAt) ----
+    const dateField = query.dateField || 'createdAt';
+    const parseDate = (s: any): Date | null => {
+      if (!s) return null;
+      const d = new Date(s);
+      return isNaN(d.getTime()) ? null : d;
+    };
+    if (query.lastNDays != null) {
+      const cut = new Date(Date.now() - query.lastNDays * 86400000);
+      docs = docs.filter((p) => { const d = parseDate(p[dateField]); return d !== null && d >= cut; });
+    }
+    if (query.lastNMonths != null) {
+      const cut = new Date();
+      cut.setMonth(cut.getMonth() - query.lastNMonths);
+      docs = docs.filter((p) => { const d = parseDate(p[dateField]); return d !== null && d >= cut; });
+    }
+    if (query.createdAfter) {
+      const a = parseDate(query.createdAfter);
+      if (a) docs = docs.filter((p) => { const d = parseDate(p[dateField]); return d !== null && d >= a; });
+    }
+    if (query.createdBefore) {
+      const b = parseDate(query.createdBefore);
+      if (b) docs = docs.filter((p) => { const d = parseDate(p[dateField]); return d !== null && d <= b; });
+    }
+
     const rows = docs.map((p) => {
       const val = this.num(p[field]);
       return {
@@ -185,6 +239,7 @@ export class ProjectAnalyticsService {
         city: p.city,
         state: p.state,
         zone: p.zone,
+        region: toRegion(p.zone),
         stage: p.stage,
         subStage: p.subStage,
         channel: p.channel,
@@ -203,6 +258,23 @@ export class ProjectAnalyticsService {
 
     const totalVal = rows.reduce((sum, r) => sum + r.value, 0);
     const top = [...rows].sort((a, b) => b.value - a.value).slice(0, topN);
+
+    // Timeline: group counts/totals by month or quarter of the date field.
+    let timeline: Record<string, { count: number; total: number }> | undefined;
+    if (query.bucketBy) {
+      timeline = {};
+      for (const p of docs) {
+        const d = parseDate(p[dateField]);
+        if (!d) continue;
+        const key =
+          query.bucketBy === 'quarter'
+            ? `${d.getFullYear()}-Q${Math.floor(d.getMonth() / 3) + 1}`
+            : `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+        timeline[key] = timeline[key] || { count: 0, total: 0 };
+        timeline[key].count += 1;
+        timeline[key].total += this.num(p[field]);
+      }
+    }
 
     let breakdown: Record<string, { count: number; total: number }> | undefined;
     if (query.groupBy) {
@@ -231,6 +303,7 @@ export class ProjectAnalyticsService {
       formattedAverage: this.formatNumber(rows.length ? totalVal / rows.length : 0, null),
       top,
       breakdown,
+      timeline,
     };
   }
 }

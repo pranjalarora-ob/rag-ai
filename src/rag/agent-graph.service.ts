@@ -92,29 +92,55 @@ export class AgentGraphService {
       const session = await this.chatService.createSession(params.customerId, params.question);
       activeSessionId = (session as any)._id.toString();
     }
-    // Save user question
-    await this.chatService.addMessage(activeSessionId, 'user', params.question);
+    // Persist the user message but DON'T block the response on the DB write.
+    this.chatService.addMessage(activeSessionId, 'user', params.question).catch(() => {});
 
-    const final = await this.graph.invoke(
-      {
-        question: params.question,
-        customerId: params.customerId,
-        history: params.history ?? [],
-      },
-      { configurable: { thread_id: crypto.randomUUID() } },
-    );
+    // Small-talk fast-path: greetings / thanks / acks don't need embedding, the
+    // supervisor LLM, or any retrieval — answer instantly and skip the whole graph.
+    const canned = this.smallTalkAnswer(params.question);
+    let answer: string;
+    let route = 'smalltalk';
+    let trace: AgentGraphResult['trace'] = [];
+    let cached = false;
 
-    const answer = final.answer ?? '';
-    // Save assistant answer
-    await this.chatService.addMessage(activeSessionId, 'assistant', answer);
+    if (canned) {
+      answer = canned;
+    } else {
+      const final = await this.graph.invoke(
+        {
+          question: params.question,
+          customerId: params.customerId,
+          history: params.history ?? [],
+        },
+        { configurable: { thread_id: crypto.randomUUID() } },
+      );
+      answer = final.answer ?? '';
+      route = final.route ?? 'analytics';
+      trace = final.trace ?? [];
+      cached = !!final.cached;
+    }
 
-    return {
-      answer,
-      route: final.route ?? 'analytics',
-      trace: final.trace ?? [],
-      cached: !!final.cached,
-      sessionId: activeSessionId,
-    };
+    // Persist the assistant answer without blocking either.
+    this.chatService.addMessage(activeSessionId, 'assistant', answer).catch(() => {});
+
+    return { answer, route, trace, cached, sessionId: activeSessionId };
+  }
+
+  // Whole-message small talk → a canned reply, so trivial inputs skip the pipeline.
+  // Matches the ENTIRE message (not a substring), so "hi, cost of project X" still
+  // goes through the graph — only a bare "hi" / "thanks" / "ok" short-circuits.
+  private smallTalkAnswer(question: string): string | null {
+    const q = (question || '').trim().toLowerCase().replace(/[!.?,]+$/g, '').trim();
+    if (!q || q.length > 24) return null;
+    const greet = ['hi', 'hii', 'hello', 'helo', 'hey', 'heya', 'yo', 'hola', 'namaste', 'good morning', 'good afternoon', 'good evening'];
+    const thank = ['thanks', 'thank you', 'thankyou', 'thank u', 'thx', 'ty'];
+    const bye = ['bye', 'goodbye', 'see you', 'see ya', 'cya'];
+    const ack = ['ok', 'okay', 'okk', 'k', 'cool', 'great', 'nice', 'got it', 'sounds good', 'perfect', 'awesome'];
+    if (greet.includes(q)) return 'Hi! I can help with project info — ask me about a project, its cost, area, stage, zone, schedule, or leads.';
+    if (thank.includes(q)) return "You're welcome! Anything else you'd like to know about your projects?";
+    if (bye.includes(q)) return 'Goodbye! Come back anytime you need project information.';
+    if (ack.includes(q)) return 'Got it. What would you like to know about your projects?';
+    return null;
   }
 
   /**
@@ -427,11 +453,18 @@ QUESTION: ${state.question}`,
   private async classify(question: string): Promise<Route> {
     // Deterministic disambiguation first — a specific field filter can't be an aggregate.
     const q = question.toLowerCase();
-    // Schedule/workflow intent → the project-flow stepper. Wins over other routes.
+    const hasCode = /\b(\d{6,})\b/.test(q);
+    // Schedule/workflow intent → the single-project flow stepper. Only when a specific
+    // project code is present: "schedule/timeline/milestones for project 2022072258".
     const scheduleIntent = /\b(schedule|timeline|road ?map|workflow|project flow|phases?|milestones?)\b/.test(q);
-    if (scheduleIntent) return 'schedule';
+    if (scheduleIntent && hasCode) return 'schedule';
+    // Aggregate workflow/stage questions across projects (no single code) — pending
+    // payments, stuck-at-stage, handover milestones, mobilization, funnel — go to the
+    // planner (analytics), which owns the queryProjectFlow tool.
+    const flowIntent = /\b(milestones?|payment (due|pending)|pending payment|overdue|due (in|within|this|next)|handover|mobili[sz]ation|behind schedule|stuck (at|in)|pending (approval|action)|awaiting (client )?approval|site not started|funnel|stage)\b/.test(q);
+    if (flowIntent && !hasCode) return 'analytics';
     // If the question contains a 6+ digit project code, bypass the LLM and route directly to lookup!
-    if (/\b(\d{6,})\b/.test(q)) return 'lookup';
+    if (hasCode) return 'lookup';
     const descriptive = /\b(tell me about|who is|who are|design manager|notes|describe|context|details about)\b/.test(q);
     const fieldFilter = /\b(in|from|at)\s+[a-z]|area|sqft|sq ft|estimated value|owner|zone|project code|leads?\b|projects?\b/.test(q);
     const aggregate = /\b(total|sum|average|avg|count|how many|highest|lowest|top\s*\d+|rank|most|least|combined|per\s+\w+|group)\b/.test(q);

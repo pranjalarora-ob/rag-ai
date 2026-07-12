@@ -3,6 +3,7 @@ import { Response } from 'express';
 import { OpenaiService } from './openai.service';
 import { QdrantService } from './qdrant.service';
 import { ProjectAnalyticsService } from './project-analytics.service';
+import { ProjectFlowService } from './project-flow.service';
 import { RerankService } from './rerank.service';
 import { SYSTEM_PROMPT, COLLECTION } from './constants';
 
@@ -56,6 +57,7 @@ export class PlannerService {
     private readonly openaiService: OpenaiService,
     private readonly qdrantService: QdrantService,
     private readonly projectAnalyticsService: ProjectAnalyticsService,
+    private readonly projectFlowService: ProjectFlowService,
     private readonly rerankService: RerankService,
   ) { }
 
@@ -91,12 +93,13 @@ export class PlannerService {
             role: { type: 'string', description: 'Role to match with teamMember, e.g. "Design Manager".' },
             groupBy: {
               type: 'string',
-              enum: ['stage', 'subStage', 'city', 'state', 'zone', 'owner', 'channel', 'projectStatus'],
-              description: 'Group counts/totals by this field, e.g. "how many projects per stage".',
+              enum: ['stage', 'subStage', 'city', 'state', 'zone', 'region', 'owner', 'channel', 'projectStatus'],
+              description: 'Group counts/totals by this field, e.g. "how many projects per stage". Prefer "region" over "zone" for zone-wise questions — raw zone mixes regions and cities.',
             },
             city: { type: 'string', description: 'Filter by city, e.g. "Gurugram".' },
             state: { type: 'string', description: 'Filter by state, e.g. "Haryana".' },
-            zone: { type: 'string', description: 'Filter by zone, e.g. "Gurgaon".' },
+            zone: { type: 'string', description: 'Filter by raw zone/hub, e.g. "Gurgaon".' },
+            region: { type: 'string', description: 'Filter by normalized region: North, South, East, or West. Prefer this over zone for "in the North" style questions.' },
             stage: { type: 'string', description: 'Filter by stage, e.g. "Execution", "Design-Sales".' },
             subStage: { type: 'string', description: 'Filter by sub-stage, e.g. "Handover".' },
             owner: { type: 'string', description: 'Filter by owner/team, e.g. "SMB Team".' },
@@ -110,6 +113,49 @@ export class PlannerService {
             minArea: { type: 'number', description: 'areaSft >= this (in sqft).' },
             maxArea: { type: 'number', description: 'areaSft <= this (in sqft).' },
             equalsArea: { type: 'number', description: 'areaSft EXACTLY equals this (in sqft). Use for "area equal to X". Takes precedence over min/maxArea.' },
+            type: { type: 'string', enum: ['lead', 'project'], description: 'Filter by record type: "lead" (not yet converted) or "project". Use for "how many leads..." vs "how many projects...".' },
+            active: { type: 'boolean', description: 'true = only active projects, false = only inactive. Use for "active projects".' },
+            ownerMissing: { type: 'boolean', description: 'true = only records with NO assigned owner. Use for "unassigned" / "no owner".' },
+            dateField: { type: 'string', enum: ['createdAt', 'updatedAt'], description: 'Which date the date filters/buckets use. Default createdAt (creation/lead date).' },
+            lastNDays: { type: 'number', description: 'Only records whose date is within the last N days. Use for "last 30 days".' },
+            lastNMonths: { type: 'number', description: 'Only records whose date is within the last N months. Use for "last 3 months", "last 6 months".' },
+            createdAfter: { type: 'string', description: 'ISO date (YYYY-MM-DD). Only records dated on/after this.' },
+            createdBefore: { type: 'string', description: 'ISO date (YYYY-MM-DD). Only records dated on/before this.' },
+            bucketBy: { type: 'string', enum: ['month', 'quarter'], description: 'Return a timeline breakdown grouped by month or quarter. Use for trends ("trend over last 6 months", "this quarter vs last").' },
+          },
+        },
+      },
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'queryProjectFlow',
+        description:
+          'Query the project WORKFLOW/STAGE data (phases + milestones with status and due dates) across all projects. Use for questions about milestone status, phase progress, pending payments, handover stage, "stuck at" a stage, the stage funnel, and DUE-DATE questions — overdue milestones, "due in the next N days", behind schedule. A milestone\'s endDate is its due date. Status is COMPLETED / IN_PROGRESS / PENDING (not completed).',
+        parameters: {
+          type: 'object',
+          properties: {
+            operation: {
+              type: 'string',
+              enum: ['countProjects', 'listProjects', 'listMilestones', 'funnel'],
+              description: 'countProjects = how many projects match; listProjects = list them; listMilestones = list the matching milestones; funnel = count of projects grouped by their current phase (stage funnel view).',
+            },
+            projectCode: { type: 'string', description: 'Restrict to a single project by its code.' },
+            phaseName: { type: 'string', description: 'Filter by phase name (substring), e.g. "Execution", "Design", "Handover", "Pre-Sales".' },
+            phaseStatus: { type: 'string', enum: ['COMPLETED', 'IN_PROGRESS', 'PENDING', 'NOT_STARTED'], description: 'Filter phases by status. PENDING = anything not completed.' },
+            milestoneName: { type: 'string', description: 'Filter by milestone name (substring), e.g. "Payment", "Handover", "Mobilization", "Site Kick-Off".' },
+            milestoneStatus: { type: 'string', enum: ['COMPLETED', 'IN_PROGRESS', 'PENDING', 'NOT_STARTED'], description: 'Filter milestones by status. Use PENDING for "pending payment"/"pending action" (= not completed).' },
+            hasCompleted: { type: 'string', description: 'Project has a COMPLETED milestone whose name contains this, e.g. "Mobilization Advance".' },
+            missing: { type: 'string', description: 'Project does NOT have completed a milestone whose name contains this, e.g. "Site Kick-Off". Combine with hasCompleted for "received X but not yet Y".' },
+            overdue: { type: 'boolean', description: 'Only milestones past their due date (endDate < today) and not completed. Use for "overdue" / "behind schedule".' },
+            dueWithinDays: { type: 'number', description: 'Only milestones due within the next N days (endDate between today and today+N), not yet completed. Use for "due in the next 2 weeks" (N=14).' },
+            dueBefore: { type: 'string', description: 'ISO date (YYYY-MM-DD). Only milestones due on/before this date.' },
+            dueAfter: { type: 'string', description: 'ISO date (YYYY-MM-DD). Only milestones due on/after this date.' },
+            region: { type: 'string', description: 'Filter matched projects by normalized region: North, South, East, West.' },
+            zone: { type: 'string', description: 'Filter matched projects by raw zone/hub, e.g. "Gurgaon".' },
+            city: { type: 'string', description: 'Filter matched projects by city, e.g. "Gurugram".' },
+            owner: { type: 'string', description: 'Filter matched projects by owner/team.' },
+            groupBy: { type: 'string', enum: ['region', 'zone', 'city', 'owner', 'currentPhase'], description: 'Group the matching projects and return counts per group. Use "region" for "zone-wise ..." questions (regions are cleaner than raw zone), "currentPhase" for a stage funnel.' },
           },
         },
       },
@@ -125,8 +171,11 @@ You are the PLANNER. Decide which tool(s) to call to answer the user, call them,
 Rules:
 - The customerId is "${customerId}" and is already known — never ask the user for it.
 - For totals, counts, averages, rankings, filtered sums/lists, or ANY chart/comparison request, you MUST call projectAnalytics. Do not calculate numbers yourself.
+- For "leads" vs "projects" use projectAnalytics type="lead"/"project"; for "active" use active=true; for "unassigned"/"no owner" use ownerMissing=true.
+- For date windows ("last 30 days", "last 3/6 months", "this quarter") use lastNDays/lastNMonths (or createdAfter/createdBefore) on projectAnalytics; for trends over time add bucketBy="month" or "quarter" and present the timeline as a table.
 - When the user names one or more specific project codes (e.g. "project code 2022072479"), call projectAnalytics with projectCodes set to those codes — never use searchProjects for an exact code.
 - For descriptive questions about a specific project, call searchProjects.
+- For questions about project WORKFLOW/STAGE progress — milestone status, pending payments, overdue or upcoming-due milestones, "behind schedule", which projects are at/stuck-at a stage, mobilization/handover milestones, or the stage funnel — call queryProjectFlow. A milestone's endDate is its due date: use overdue=true for "overdue"/"behind schedule" and dueWithinDays for "due in the next N days".
 - Base every fact and number ONLY on tool results. If the tools return nothing relevant, say you don't have that information.
 - When you have enough information, reply with the final answer as a markdown table (if multiple records) or plain text (if single fact).`;
   }
@@ -256,6 +305,7 @@ Rules:
           city: args.city,
           state: args.state,
           zone: args.zone,
+          region: args.region,
           stage: args.stage,
           subStage: args.subStage,
           owner: args.owner,
@@ -269,6 +319,38 @@ Rules:
           minArea: args.minArea,
           maxArea: args.maxArea,
           equalsArea: args.equalsArea,
+          type: args.type,
+          active: args.active,
+          ownerMissing: args.ownerMissing,
+          dateField: args.dateField,
+          lastNDays: args.lastNDays,
+          lastNMonths: args.lastNMonths,
+          createdAfter: args.createdAfter,
+          createdBefore: args.createdBefore,
+          bucketBy: args.bucketBy,
+        });
+      }
+
+      if (name === 'queryProjectFlow') {
+        return this.projectFlowService.analyze({
+          customerId,
+          operation: args.operation,
+          projectCode: args.projectCode,
+          phaseName: args.phaseName,
+          phaseStatus: args.phaseStatus,
+          milestoneName: args.milestoneName,
+          milestoneStatus: args.milestoneStatus,
+          hasCompleted: args.hasCompleted,
+          missing: args.missing,
+          overdue: args.overdue,
+          dueWithinDays: args.dueWithinDays,
+          dueBefore: args.dueBefore,
+          dueAfter: args.dueAfter,
+          region: args.region,
+          zone: args.zone,
+          city: args.city,
+          owner: args.owner,
+          groupBy: args.groupBy,
         });
       }
 

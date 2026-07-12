@@ -6,6 +6,7 @@ import { OpenaiService } from './openai.service';
 import { ClaudeService } from './claude.service';
 import { GuardrailService } from './guardrail.service';
 import { ProjectAnalyticsService } from './project-analytics.service';
+import { ProjectFlowService } from './project-flow.service';
 import { PlannerService } from './planner.service';
 import { RerankService } from './rerank.service';
 import { ProjectQueryService } from './project-query.service';
@@ -27,6 +28,7 @@ import { SemanticCacheService } from './semantic-cache.service';
     ClaudeService,
     GuardrailService,
     ProjectAnalyticsService,
+    ProjectFlowService,
     PlannerService,
     RerankService,
     ProjectQueryService,
