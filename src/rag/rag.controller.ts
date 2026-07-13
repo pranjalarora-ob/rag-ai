@@ -1,7 +1,9 @@
 import {
   Controller, Post, Body, Param, Get, Res, Patch,
   BadRequestException, InternalServerErrorException,
+  UseInterceptors, UploadedFile,
 } from '@nestjs/common';
+import { FileInterceptor } from '@nestjs/platform-express';
 import { ApiOperation, ApiProduces, ApiResponse, ApiTags } from '@nestjs/swagger';
 import { Response } from 'express';
 import { ChatDto, IngestVectorDataDto, PlannerDto } from './dto/rag.dto';
@@ -16,6 +18,7 @@ import { PlannerService } from './planner.service';
 import { RerankService } from './rerank.service';
 import { ProjectAgentService } from './project-agent.service';
 import { AgentGraphService } from './agent-graph.service';
+import { VoiceService } from './voice.service';
 import { SemanticCacheService } from './semantic-cache.service';
 import { SYSTEM_PROMPT, COLLECTION } from './constants';
 import { ChatService } from '../chat/chat.service';
@@ -33,9 +36,34 @@ export class RagController {
     private readonly rerankService: RerankService,
     private readonly projectAgentService: ProjectAgentService,
     private readonly agentGraphService: AgentGraphService,
+    private readonly voiceService: VoiceService,
     private readonly semanticCache: SemanticCacheService,
     private readonly chatService: ChatService,
   ) { }
+
+  // ============ Voice-to-text (Ringg Parrot STT) ============
+
+  @ApiOperation({ summary: 'Transcribe an uploaded audio clip to text (Ringg Parrot STT)' })
+  @Post('voice')
+  @UseInterceptors(FileInterceptor('file'))
+  async voice(
+    @UploadedFile() file: { buffer: Buffer; originalname?: string; mimetype?: string } | undefined,
+    @Body('language') language?: string,
+  ) {
+    if (!file?.buffer?.length) {
+      throw new BadRequestException('No audio uploaded — send it as multipart field "file".');
+    }
+    try {
+      const transcript = await this.voiceService.transcribe(
+        file.buffer,
+        file.originalname || 'audio.wav',
+        language || 'en',
+      );
+      return { transcript };
+    } catch (err: any) {
+      throw new InternalServerErrorException(err?.message || 'Transcription failed');
+    }
+  }
 
   // ============ Ingestion ============
 
