@@ -181,6 +181,7 @@ export class RagController {
       customerId: body.customerId,
       sessionId: body.sessionId,
       history: body.history,
+      userName: body.userName,
     });
   }
 
@@ -195,6 +196,7 @@ export class RagController {
         customerId: body.customerId,
         sessionId: body.sessionId,
         history: body.history,
+        userName: body.userName,
         res,
       });
     } catch (err) {

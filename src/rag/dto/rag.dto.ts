@@ -76,6 +76,11 @@ export class PlannerDto {
   @IsString()
   sessionId?: string;
 
+  @ApiProperty({ description: 'Logged-in user display name — resolves "my projects" / "who am I"', required: false })
+  @IsOptional()
+  @IsString()
+  userName?: string;
+
   @ApiProperty({ description: 'Prior conversation turns for context', type: [ChatHistoryMessageDto], required: false })
   @IsOptional()
   @IsArray()

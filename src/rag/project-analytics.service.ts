@@ -22,6 +22,12 @@ export interface AnalyticsQuery {
   teamMember?: string;
   role?: string;
   groupBy?: 'stage' | 'subStage' | 'city' | 'state' | 'zone' | 'region' | 'owner' | 'channel' | 'projectStatus';
+  // Secondary dimension for a cross-tab / pivot (e.g. groupBy="city", groupBy2="stage"
+  // → count of projects per city per stage). Only used when groupBy is also set.
+  groupBy2?: 'stage' | 'subStage' | 'city' | 'state' | 'zone' | 'region' | 'owner' | 'channel' | 'projectStatus';
+  // Group by the PERSON holding a given team/POC role, e.g. "General Manager" → per-GM
+  // workload. Matches team[].role / team[].pocRole and groups by that member's name.
+  groupByRole?: string;
   city?: string;
   state?: string;
   zone?: string;
@@ -98,6 +104,21 @@ export class ProjectAnalyticsService {
       if (key && !byDoc.has(key)) byDoc.set(key, p);
     }
     return [...byDoc.values()];
+  }
+
+  // Name of the team member holding a given role on a project (e.g. "General Manager").
+  // Matches the free-text `role` and the enum `pocRole` (SALES_GENERAL_MANAGER → "sales
+  // general manager"). "gm" is treated as "general manager".
+  private roleHolder(project: any, role: string): string | null {
+    let r = role.trim().toLowerCase();
+    if (r === 'gm') r = 'general manager';
+    const team: any[] = [...(project.team || []), ...(project.pocTeam || [])];
+    const m = team.find((t) => {
+      const rr = String(t.role || '').toLowerCase();
+      const pr = String(t.pocRole || '').toLowerCase().replace(/_/g, ' ');
+      return rr.includes(r) || pr.includes(r);
+    });
+    return (m?.name || '').trim() || null;
   }
 
   private matchesTeam(project: any, member: string, role?: string): boolean {
@@ -259,10 +280,24 @@ export class ProjectAnalyticsService {
     const totalVal = rows.reduce((sum, r) => sum + r.value, 0);
     const top = [...rows].sort((a, b) => b.value - a.value).slice(0, topN);
 
-    // Timeline: group counts/totals by month or quarter of the date field.
-    let timeline: Record<string, { count: number; total: number }> | undefined;
+    // Timeline: bucket by month/quarter of the date field. All stats (average, median)
+    // are computed HERE in code — never by the LLM — so big-number math is exact. We
+    // also report a robust median and an outlier count, because the source data has
+    // junk estimatedValue records (e.g. 1e16+) that make a plain mean meaningless.
+    const OUTLIER_THRESHOLD = 1e11; // > ~₹1000 cr is almost certainly bad data
+    let timeline:
+      | Record<string, {
+          count: number;
+          total: number;
+          average: number;
+          formattedAverage: string;
+          median: number;
+          formattedMedian: string;
+          outliers: number;
+        }>
+      | undefined;
     if (query.bucketBy) {
-      timeline = {};
+      const groups: Record<string, number[]> = {};
       for (const p of docs) {
         const d = parseDate(p[dateField]);
         if (!d) continue;
@@ -270,20 +305,63 @@ export class ProjectAnalyticsService {
           query.bucketBy === 'quarter'
             ? `${d.getFullYear()}-Q${Math.floor(d.getMonth() / 3) + 1}`
             : `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
-        timeline[key] = timeline[key] || { count: 0, total: 0 };
-        timeline[key].count += 1;
-        timeline[key].total += this.num(p[field]);
+        (groups[key] = groups[key] || []).push(this.num(p[field]));
+      }
+      timeline = {};
+      for (const key of Object.keys(groups).sort()) {
+        const arr = groups[key];
+        const total = arr.reduce((s, v) => s + v, 0);
+        const average = arr.length ? total / arr.length : 0;
+        const sorted = [...arr].sort((a, b) => a - b);
+        const mid = Math.floor(sorted.length / 2);
+        const median = !sorted.length
+          ? 0
+          : sorted.length % 2
+            ? sorted[mid]
+            : (sorted[mid - 1] + sorted[mid]) / 2;
+        timeline[key] = {
+          count: arr.length,
+          total,
+          average,
+          formattedAverage: this.formatNumber(average, null),
+          median,
+          formattedMedian: this.formatNumber(median, null),
+          outliers: arr.filter((v) => v > OUTLIER_THRESHOLD).length,
+        };
       }
     }
 
     let breakdown: Record<string, { count: number; total: number }> | undefined;
-    if (query.groupBy) {
+    if (query.groupByRole) {
+      // Group by the holder of a role (e.g. per-GM). Computed from docs (which carry
+      // team[]), keyed by the role-holder's name; projects with no such role → Unassigned.
+      breakdown = {};
+      for (const p of docs) {
+        const key = this.roleHolder(p, query.groupByRole) || 'Unassigned';
+        breakdown[key] = breakdown[key] || { count: 0, total: 0 };
+        breakdown[key].count += 1;
+        breakdown[key].total += this.num(p[field]);
+      }
+    } else if (query.groupBy) {
       breakdown = {};
       for (const r of rows) {
         const key = String((r as any)[query.groupBy!] ?? 'Unknown');
         breakdown[key] = breakdown[key] || { count: 0, total: 0 };
         breakdown[key].count += 1;
         breakdown[key].total += r.value;
+      }
+    }
+
+    // 2-D pivot / cross-tab: count of rows per (groupBy × groupBy2). Enables
+    // "city-wise breakdown by stage" without the LLM fabricating a structure.
+    let pivot: Record<string, Record<string, number>> | undefined;
+    if (query.groupBy && query.groupBy2) {
+      pivot = {};
+      for (const r of rows) {
+        const k1 = String((r as any)[query.groupBy!] ?? 'Unknown');
+        const k2 = String((r as any)[query.groupBy2!] ?? 'Unknown');
+        pivot[k1] = pivot[k1] || {};
+        pivot[k1][k2] = (pivot[k1][k2] || 0) + 1;
       }
     }
 
@@ -303,6 +381,7 @@ export class ProjectAnalyticsService {
       formattedAverage: this.formatNumber(rows.length ? totalVal / rows.length : 0, null),
       top,
       breakdown,
+      pivot,
       timeline,
     };
   }

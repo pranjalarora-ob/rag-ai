@@ -66,8 +66,20 @@ export class SemanticCacheService {
     return true;
   }
 
+  // "I don't have that data" style non-answers must never be cached — otherwise a
+  // transient miss (bad route, stale code, empty tool result) gets frozen and served
+  // back forever, even after the underlying capability is fixed.
+  private isLowValueAnswer(answer: string): boolean {
+    const a = answer.toLowerCase();
+    return /\b(i\s+(don'?t|do not)\s+have|i\s+(couldn'?t|could not|cannot|can'?t)\s+(find|answer|provide)|no\s+(relevant\s+)?(data|information|records?|results?|matches?)|not\s+available|don'?t\s+have\s+(specific|that|any|access)|unable\s+to)\b/.test(a);
+  }
+
   async save(question: string, embedding: number[], answer: string, customerId: string): Promise<void> {
     if (!answer?.trim() || !embedding?.length) return;
+    if (this.isLowValueAnswer(answer)) {
+      console.log(`[SemanticCache] SKIP save (non-answer) q="${question.slice(0, 60)}"`);
+      return;
+    }
     try {
       await this.qdrantService.createCollection(CACHE_COLLECTION);
       await this.qdrantService.upsert(CACHE_COLLECTION, [

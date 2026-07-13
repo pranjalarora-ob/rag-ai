@@ -52,6 +52,7 @@ const GraphState = Annotation.Root({
   question: Annotation<string>(),
   customerId: Annotation<string>(),
   history: Annotation<Array<{ role: string; content: string }>>(),
+  userName: Annotation<string>(),
   route: Annotation<Route>(),
   answer: Annotation<string>(),
   trace: Annotation<AgentGraphResult['trace']>(),
@@ -86,6 +87,7 @@ export class AgentGraphService {
     customerId: string;
     sessionId?: string;
     history?: Array<{ role: string; content: string }>;
+    userName?: string;
   }): Promise<AgentGraphResult> {
     let activeSessionId = params.sessionId;
     if (!activeSessionId) {
@@ -95,9 +97,8 @@ export class AgentGraphService {
     // Persist the user message but DON'T block the response on the DB write.
     this.chatService.addMessage(activeSessionId, 'user', params.question).catch(() => {});
 
-    // Small-talk fast-path: greetings / thanks / acks don't need embedding, the
-    // supervisor LLM, or any retrieval — answer instantly and skip the whole graph.
-    const canned = this.smallTalkAnswer(params.question);
+    // Fast-paths that don't need the graph: identity ("who am I") and small-talk.
+    const canned = this.identityAnswer(params.question, params.userName) ?? this.smallTalkAnswer(params.question);
     let answer: string;
     let route = 'smalltalk';
     let trace: AgentGraphResult['trace'] = [];
@@ -111,6 +112,7 @@ export class AgentGraphService {
           question: params.question,
           customerId: params.customerId,
           history: params.history ?? [],
+          userName: params.userName ?? '',
         },
         { configurable: { thread_id: crypto.randomUUID() } },
       );
@@ -124,6 +126,17 @@ export class AgentGraphService {
     this.chatService.addMessage(activeSessionId, 'assistant', answer).catch(() => {});
 
     return { answer, route, trace, cached, sessionId: activeSessionId };
+  }
+
+  // Identity fast-path: "who am I" / "what's my name" → answer from the passed-in
+  // user name, no retrieval. Returns null if there's no name or it isn't an identity Q.
+  private identityAnswer(question: string, userName?: string): string | null {
+    if (!userName) return null;
+    const q = (question || '').trim().toLowerCase().replace(/[!.?,]+$/g, '').trim();
+    if (/^(who am i|what('?s| is) my name|do you know (who i am|my name)|my name)$/.test(q)) {
+      return `You're ${userName}. I can show your projects, leads, or schedules — for example ask "my projects".`;
+    }
+    return null;
   }
 
   // Whole-message small talk → a canned reply, so trivial inputs skip the pipeline.
@@ -153,6 +166,7 @@ export class AgentGraphService {
     customerId: string;
     sessionId?: string;
     history?: Array<{ role: string; content: string }>;
+    userName?: string;
     res: Response;
     onAnswer?: (answer: string) => void;
   }): Promise<void> {
@@ -180,6 +194,22 @@ export class AgentGraphService {
   // ============ Nodes ============
 
   private guardrailNode = async (state: GraphState) => {
+    if (this.guardrail.isAbusive(state.question)) {
+      console.log('🛡️ Guardrail: abusive language blocked');
+      return {
+        blocked: true,
+        answer:
+          "I'd like to keep our conversation respectful. I'm happy to help with any questions about your projects — their details, stages, schedules, or numbers.",
+      };
+    }
+    if (this.guardrail.isOutOfScopeAction(state.question)) {
+      console.log('🛡️ Guardrail: out-of-scope action blocked');
+      return {
+        blocked: true,
+        answer:
+          "That's outside what I can do — I'm a read-only assistant for looking up project information (details, counts, stages, schedules, leads). I can't create, edit, or delete records. Please use the Workbench for that.",
+      };
+    }
     if (this.guardrail.isPolicyViolation(state.question)) {
       console.log('🛡️ Guardrail: policy violation blocked');
       return {
@@ -210,9 +240,25 @@ export class AgentGraphService {
       question: state.question,
       customerId: state.customerId,
       history: state.history,
+      // For "above/these/those" follow-ups, hand the planner the exact codes from the
+      // previous list so the (weak) LLM doesn't have to scrape them out of the table.
+      referencedCodes: this.extractRecentCodes(state.question, state.history),
+      userName: state.userName,
     });
     return { answer: r.answer, trace: r.trace };
   };
+
+  // If the question is referential ("above/these/those projects"), pull the project
+  // codes from the most recent assistant list in the conversation. Returns [] otherwise.
+  private extractRecentCodes(question: string, history?: Array<{ role: string; content: string }>): string[] {
+    const referential = /\b(above|these|those|them|aforementioned|the (above|previous|listed)|that list|same (projects?|ones))\b/i.test(question);
+    if (!referential || !history?.length) return [];
+    for (const h of [...history].reverse()) {
+      const codes = String(h?.content || '').match(/\b\d{6,}\b/g);
+      if (codes && codes.length) return [...new Set(codes)].slice(0, 50);
+    }
+    return [];
+  }
 
   // lookup: exact filtered list/count by field — reuse ProjectAgentService (deterministic queryProjects).
   private lookupAgentNode = async (state: GraphState) => {
@@ -454,6 +500,12 @@ QUESTION: ${state.question}`,
     // Deterministic disambiguation first — a specific field filter can't be an aggregate.
     const q = question.toLowerCase();
     const hasCode = /\b(\d{6,})\b/.test(q);
+    // Referential follow-up ("owner of the above projects", "details of these",
+    // "who owns them") — must resolve against the previous list in the conversation.
+    // Only the planner receives history, so route these there (lookup ignores history).
+    const referential =
+      /\b(above|these|those|them|aforementioned|the (above|previous|listed)|that list|same (projects?|ones))\b/.test(q);
+    if (referential) return 'analytics';
     // Schedule/workflow intent → the single-project flow stepper. Only when a specific
     // project code is present: "schedule/timeline/milestones for project 2022072258".
     const scheduleIntent = /\b(schedule|timeline|road ?map|workflow|project flow|phases?|milestones?)\b/.test(q);
@@ -461,8 +513,25 @@ QUESTION: ${state.question}`,
     // Aggregate workflow/stage questions across projects (no single code) — pending
     // payments, stuck-at-stage, handover milestones, mobilization, funnel — go to the
     // planner (analytics), which owns the queryProjectFlow tool.
-    const flowIntent = /\b(milestones?|payment (due|pending)|pending payment|overdue|due (in|within|this|next)|handover|mobili[sz]ation|behind schedule|stuck (at|in)|pending (approval|action)|awaiting (client )?approval|site not started|funnel|stage)\b/.test(q);
+    const flowIntent = /\b(milestones?|payment (due|pending)|pending payment|overdue|due (in|within|this|next)|handover|handed over|mobili[sz]ation|behind schedule|stuck (at|in)|pending (approval|action)|awaiting (client )?approval|site not started|funnel|stage)\b/.test(q);
     if (flowIntent && !hasCode) return 'analytics';
+    // Temporal / trend / lead / group-by intent → the planner owns the date + lead +
+    // groupBy tools, so route these there rather than to lookup (which has none).
+    // e.g. "new leads last 3 months", "zone-wise ...", "trend over 6 months".
+    const temporalTrendIntent =
+      /\b(last|past)\s+\d+\s+(day|days|week|weeks|month|months|quarter|quarters|year|years)\b|\b(this|previous|current|next)\s+(week|month|quarter|year)\b|\btrend\b|\bnew leads?\b|\bunassigned\b|\bactive\b|[a-z]+-wise\b|\bwise\b/.test(q);
+    if (temporalTrendIntent && !hasCode) return 'analytics';
+    // Person / role queries — "projects of <name>", "where X is a team member/customer/GM",
+    // per-GM workload. The planner owns teamMember/customerName/groupByRole.
+    const personIntent =
+      /\b(team member|is (the|a) (customer|gm|owner|team member|general manager)|as (a )?(team member|customer|gm|owner)|owned by|handled by|managed by|per gm|gm workload|which gm)\b/i.test(q) ||
+      /\bprojects?\s+(of|for|by|under)\s+[a-z]/i.test(q); // "projects of Nitish"
+    if (personIntent && !hasCode) return 'analytics';
+    // First-person ("my projects", "leads assigned to me") → planner resolves "me" to
+    // the logged-in user name.
+    const firstPersonIntent =
+      /\bmy\s+(projects?|leads?)\b|\b(projects?|leads?)\b[^.]*\b(assigned to me|of mine|i'?m on)\b|\bassigned to me\b/i.test(q);
+    if (firstPersonIntent && !hasCode) return 'analytics';
     // If the question contains a 6+ digit project code, bypass the LLM and route directly to lookup!
     if (hasCode) return 'lookup';
     const descriptive = /\b(tell me about|who is|who are|design manager|notes|describe|context|details about)\b/.test(q);

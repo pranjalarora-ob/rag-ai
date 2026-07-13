@@ -93,8 +93,17 @@ export class PlannerService {
             role: { type: 'string', description: 'Role to match with teamMember, e.g. "Design Manager".' },
             groupBy: {
               type: 'string',
-              enum: ['stage', 'subStage', 'city', 'state', 'zone', 'region', 'owner', 'channel', 'projectStatus'],
-              description: 'Group counts/totals by this field, e.g. "how many projects per stage". Prefer "region" over "zone" for zone-wise questions — raw zone mixes regions and cities.',
+              enum: ['stage', 'subStage', 'city', 'state', 'region', 'owner', 'channel', 'projectStatus'],
+              description: 'Group counts/totals by this field, e.g. "how many projects per stage". For any zone-wise / region-wise question ALWAYS use "region" (North/South/East/West) — never group by raw zone.',
+            },
+            groupBy2: {
+              type: 'string',
+              enum: ['stage', 'subStage', 'city', 'state', 'region', 'owner', 'channel', 'projectStatus'],
+              description: 'SECOND dimension for a cross-tab/pivot. For "X-wise breakdown BY Y" set groupBy=X and groupBy2=Y (e.g. "city-wise breakdown by stage" → groupBy="city", groupBy2="stage"). The result "pivot" is X→Y→count; render it as a table with X as rows and Y as columns.',
+            },
+            groupByRole: {
+              type: 'string',
+              description: 'Group by the PERSON holding a team role. Use "General Manager" for any "per GM / GM workload / which GM" question (a GM is the team member with role General Manager). Returns a breakdown keyed by each person\'s name.',
             },
             city: { type: 'string', description: 'Filter by city, e.g. "Gurugram".' },
             state: { type: 'string', description: 'Filter by state, e.g. "Haryana".' },
@@ -155,7 +164,7 @@ export class PlannerService {
             zone: { type: 'string', description: 'Filter matched projects by raw zone/hub, e.g. "Gurgaon".' },
             city: { type: 'string', description: 'Filter matched projects by city, e.g. "Gurugram".' },
             owner: { type: 'string', description: 'Filter matched projects by owner/team.' },
-            groupBy: { type: 'string', enum: ['region', 'zone', 'city', 'owner', 'currentPhase'], description: 'Group the matching projects and return counts per group. Use "region" for "zone-wise ..." questions (regions are cleaner than raw zone), "currentPhase" for a stage funnel.' },
+            groupBy: { type: 'string', enum: ['region', 'city', 'owner', 'currentPhase'], description: 'Group the matching projects and return counts per group. Use "region" for any "zone-wise ..." question (never raw zone), "currentPhase" for a stage funnel.' },
           },
         },
       },
@@ -173,8 +182,25 @@ Rules:
 - For totals, counts, averages, rankings, filtered sums/lists, or ANY chart/comparison request, you MUST call projectAnalytics. Do not calculate numbers yourself.
 - For "leads" vs "projects" use projectAnalytics type="lead"/"project"; for "active" use active=true; for "unassigned"/"no owner" use ownerMissing=true.
 - For date windows ("last 30 days", "last 3/6 months", "this quarter") use lastNDays/lastNMonths (or createdAfter/createdBefore) on projectAnalytics; for trends over time add bucketBy="month" or "quarter" and present the timeline as a table.
+- NEVER compute averages/totals yourself — read the exact numbers from the tool result. For a timeline bucket use its "formattedAverage" / "formattedMedian" verbatim. When a bucket's "outliers" is > 0, the mean is skewed by bad data-entry records, so present the "formattedMedian" as the typical value and add a short note that the average is skewed by outlier records.
+- For COUNT or group-by questions, the answer table must show the group and its COUNT. Do NOT add an area or value column unless the user explicitly asked about area or value.
+- For a two-dimension "X-wise breakdown BY Y" / "X by Y" question, set BOTH groupBy=X and groupBy2=Y and render the returned "pivot" as a table (X = rows, Y = columns). NEVER invent a single row/label to fake a breakdown — if you only grouped one field, present only that field.
+- "Started" = created in the period (projectAnalytics, lastNMonths). Any "<stage> completed/done/reached" = a COMPLETED milestone of that name: call queryProjectFlow with milestoneName=<the stage>, milestoneStatus="COMPLETED", groupBy="region" (add dueAfter/dueBefore for a time window).
+- BUSINESS DEFINITIONS:
+  * "delayed" / "behind schedule" / "overdue" / "not completed on time" = a milestone whose due date (endDate) has passed and is not COMPLETED → use queryProjectFlow overdue=true.
+  * "pending" (payment/approval/action) = that milestone not COMPLETED → milestoneStatus="PENDING".
+  * "project completed" / "completion" / "completion rate" = the "Project Closure" milestone is COMPLETED → queryProjectFlow milestoneName="Project Closure", milestoneStatus="COMPLETED". A completion RATE = completed projects ÷ total projects (call once for completed, once for total).
+  * "GM" = the team member whose role is General Manager. For "per GM / GM workload / which GM" use projectAnalytics groupByRole="General Manager".
+- PERSON queries (a name like "Nitish"): "projects of <Name>" / "<Name>'s projects" → projectAnalytics teamMember="<Name>" (default to team member). "where <Name> is a team member" → teamMember="<Name>". "where <Name> is the customer" → customerName="<Name>". "where <Name> is the GM" → teamMember="<Name>", role="General Manager". A bare name is ambiguous, so answer the team-member reading and you may note they can also check customer/GM.
+- COMPARISONS ("A vs B", "A compared to B", "A versus B"): make ONE tool call per side, then present the results as columns side by side in a single table. Never decline a comparison just because it has two parts — answer each part with its own tool call.
+- The real project-flow vocabulary (map the user's words to the CLOSEST of these before calling queryProjectFlow; use a distinctive substring):
+  Phases: Pre-Sales, Design-Sales, Design Delivery, Execution, Handover.
+  Milestones: Lead Creation, Customer Info Received, Client Brief Meeting, Commercial Proposal, Commercial Approval, Design Fee-Advance, Initial Design Kit, Final Design Kit, BOQ Approval, Firm BOQ Approval, Procurement Start, Site Mobilisation Advance, Site Kick-Off, GFC-Set 1, GFC-Set 2, Milestone -1/-2/-3 Payment Due, Snags Rectification, Sign off, Handover, Project Closure, Final Bill.
+  Example: "initial design kit completed" -> milestoneName="Initial Design Kit", milestoneStatus="COMPLETED".
 - When the user names one or more specific project codes (e.g. "project code 2022072479"), call projectAnalytics with projectCodes set to those codes — never use searchProjects for an exact code.
+- FOLLOW-UPS about "the above / these / those / them" projects refer to the projects in the MOST RECENT list in this conversation. Read every project code from that previous answer and call projectAnalytics with projectCodes set to ALL of them, then answer for that exact set (e.g. show code + owner). Do not say "no projects match" — the codes are in the conversation above.
 - For descriptive questions about a specific project, call searchProjects.
+- When listing projects returned by queryProjectFlow, render the table with ONLY these columns: | Project Code | Project Name | Current Phase |. Do NOT add a "Matched Milestones" or any milestone column — it is noise in a list; the user opens a project's Timeline for milestone detail.
 - For questions about project WORKFLOW/STAGE progress — milestone status, pending payments, overdue or upcoming-due milestones, "behind schedule", which projects are at/stuck-at a stage, mobilization/handover milestones, or the stage funnel — call queryProjectFlow. A milestone's endDate is its due date: use overdue=true for "overdue"/"behind schedule" and dueWithinDays for "due in the next N days".
 - Base every fact and number ONLY on tool results. If the tools return nothing relevant, say you don't have that information.
 - When you have enough information, reply with the final answer as a markdown table (if multiple records) or plain text (if single fact).`;
@@ -220,14 +246,31 @@ Rules:
     question: string;
     customerId: string;
     history?: Array<{ role: string; content: string }>;
+    referencedCodes?: string[];
+    userName?: string;
   }): Promise<PlannerResult> {
-    const { question, customerId, history = [] } = params;
+    const { question, customerId, history = [], referencedCodes = [], userName } = params;
 
     const messages: any[] = [
       { role: 'system', content: this.buildSystemInstruction(customerId) },
       ...history,
-      { role: 'user', content: question },
     ];
+    // Resolve first-person queries to the logged-in user.
+    if (userName) {
+      messages.push({
+        role: 'system',
+        content: `The current user is "${userName}". Interpret "my", "me", "mine", "I" as this person. For "my projects" / "projects assigned to me", call projectAnalytics with teamMember="${userName}".`,
+      });
+    }
+    // Hand the LLM the exact codes for an "above/these" follow-up so it only has to
+    // pass them through (not scrape them out of a previous list).
+    if (referencedCodes.length) {
+      messages.push({
+        role: 'system',
+        content: `The user is referring to these specific projects from earlier in the conversation. Use projectAnalytics with projectCodes set to EXACTLY these, then apply any sorting/metric/topN the user asked for: ${JSON.stringify(referencedCodes)}`,
+      });
+    }
+    messages.push({ role: 'user', content: question });
 
     const { trace, finalText, steps } = await this.resolveTools(messages, customerId);
     return {
@@ -302,6 +345,8 @@ Rules:
           teamMember: args.teamMember,
           role: args.role,
           groupBy: args.groupBy,
+          groupBy2: args.groupBy2,
+          groupByRole: args.groupByRole,
           city: args.city,
           state: args.state,
           zone: args.zone,
