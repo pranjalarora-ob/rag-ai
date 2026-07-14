@@ -11,8 +11,11 @@ async function bootstrap() {
   // streaming endpoints from the browser across origins.
   app.enableCors({
     origin: true,
-    methods: ['GET', 'POST', 'PATCH', 'OPTIONS'],
+    methods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization'],
+    // Expose the session id so the browser can read it and continue the same
+    // server-side conversation on the next request.
+    exposedHeaders: ['x-session-id'],
     credentials: true,
   });
 

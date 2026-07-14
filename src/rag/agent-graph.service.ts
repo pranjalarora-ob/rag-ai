@@ -113,16 +113,29 @@ export class AgentGraphService {
     history?: Array<{ role: string; content: string }>;
     userName?: string;
   }): Promise<AgentGraphResult> {
+    const isExistingSession = !!params.sessionId;
     let activeSessionId = params.sessionId;
     if (!activeSessionId) {
       const session = await this.chatService.createSession(params.customerId, params.question);
       activeSessionId = (session as any)._id.toString();
     }
-    // Persist the user message but DON'T block the response on the DB write.
-    this.chatService.addMessage(activeSessionId, 'user', params.question).catch(() => {});
 
     // Fast-paths that don't need the graph: identity ("who am I") and small-talk.
     const canned = this.identityAnswer(params.question, params.userName) ?? this.smallTalkAnswer(params.question);
+
+    // Server-side history: for an existing session, load prior turns from Mongo
+    // (BEFORE persisting the current question, so it isn't included as its own
+    // context). The FE no longer needs to send the whole thread; it only sends
+    // sessionId. Falls back to any FE-provided history if Mongo has none.
+    let history = params.history ?? [];
+    if (!canned && isExistingSession) {
+      const stored = await this.loadSessionHistory(activeSessionId!);
+      if (stored.length) history = stored;
+    }
+
+    // Persist the user message but DON'T block the response on the DB write.
+    this.chatService.addMessage(activeSessionId, 'user', params.question).catch(() => {});
+
     let answer: string;
     let route = 'smalltalk';
     let trace: AgentGraphResult['trace'] = [];
@@ -135,7 +148,7 @@ export class AgentGraphService {
         {
           question: params.question,
           customerId: params.customerId,
-          history: params.history ?? [],
+          history,
           userName: params.userName ?? '',
         },
         { configurable: { thread_id: crypto.randomUUID() } },
@@ -150,6 +163,35 @@ export class AgentGraphService {
     this.chatService.addMessage(activeSessionId, 'assistant', answer).catch(() => {});
 
     return { answer, route, trace, cached, sessionId: activeSessionId };
+  }
+
+  // Load the last few turns of a conversation from Mongo (server-side history), so
+  // the FE only needs to send a sessionId — not the whole thread — each request.
+  private async loadSessionHistory(
+    sessionId: string,
+    windowSize = 8,
+  ): Promise<Array<{ role: string; content: string }>> {
+    try {
+      const msgs = await this.chatService.getSessionHistory(sessionId);
+      return msgs
+        .filter((m: any) => (m.content || '').trim())
+        .slice(-windowSize)
+        .map((m: any) => ({ role: m.role, content: this.trimForContext(m.content) }));
+    } catch {
+      return [];
+    }
+  }
+
+  // Compact a stored message for use as LLM context: replace verbose fenced blocks
+  // (project-card / project-schedule JSON) with a short placeholder that KEEPS any
+  // project codes (so "the above project" follow-ups still resolve), and cap length.
+  private trimForContext(content: string): string {
+    let c = String(content || '').replace(/```[\s\S]*?```/g, (block) => {
+      const codes = block.match(/\b\d{6,}\b/g);
+      return codes ? `[project ${[...new Set(codes)].join(', ')}]` : '[card]';
+    });
+    c = c.replace(/\s+/g, ' ').trim();
+    return c.length > 700 ? c.slice(0, 700) + '…' : c;
   }
 
   // Identity fast-path: "who am I" / "what's my name" → answer from the passed-in
