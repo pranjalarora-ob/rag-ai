@@ -2555,7 +2555,9 @@ Question: "${question}"`,
             console.log("📐 Area range filter applied:", areaFilter);
           }
 
-          const allowedDocTypes = ["details", "flow", "financial"];
+
+          // const allowedDocTypes = ["details", "flow", "financial"];
+          const allowedDocTypes = ["project-flow-phase", "project"];
           mustFilters.push({
             should: allowedDocTypes.map((docType) => ({
               key: "docType",
