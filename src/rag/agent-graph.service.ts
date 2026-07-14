@@ -56,6 +56,21 @@ export interface AgentGraphResult {
   sessionId?: string;
 }
 
+export interface ConversationMemoryState {
+  structured: {
+    currentProject?: string;
+    currentCustomer?: string;
+    currentZone?: string;
+    currentStage?: string;
+    currentStatus?: string;
+    lastTopic?: string;
+    recentProjects: string[];
+    discussedFields: string[];
+  };
+  summary: string;
+  turnCount: number;
+}
+
 type Route = 'analytics' | 'lookup' | 'search' | 'schedule';
 
 // Graph state. Kept at module scope so `GraphState` can be referenced in node
@@ -838,7 +853,7 @@ Question: "${question}"`,
       normalizedQuestion: Annotation<string>(),
       embedding: Annotation<number[]>(),
       route: Annotation<string>(),
-      userName: Annotation<string>(), 
+      userName: Annotation<string>(),
       customerId: Annotation<string>(),
       context: Annotation<string>(),
       summary: Annotation<string>(),
@@ -854,6 +869,10 @@ Question: "${question}"`,
       trace: Annotation<Array<{ tool: string; args: any; result?: any }>>(),
       metadata: Annotation<any>(),
       subQuestions: Annotation<string[]>(),
+      // === HYBRID MEMORY: new fields ===
+      conversationMemory: Annotation<ConversationMemoryState>(),
+      originalQuestion: Annotation<string>(),
+      isFollowUp: Annotation<boolean>(),
     });
 
     type GraphState = typeof GraphAnnotation.State;
@@ -1600,6 +1619,115 @@ Question: "${question}"`,
       }
 
       return result;
+    };
+
+    const MEMORY_SUMMARIZE_EVERY_N_TURNS = 8;
+    const MEMORY_MAX_RECENT_PROJECTS = 5;
+
+    const createEmptyConversationMemory = (): ConversationMemoryState => ({
+      structured: {
+        recentProjects: [],
+        discussedFields: [],
+      },
+      summary: "",
+      turnCount: 0,
+    });
+
+    const FOLLOW_UP_PATTERNS: RegExp[] = [
+      /\bits\b/i,
+      /\bit\b/i,
+      /\bthat\b/i,
+      /\bthis\b/i,
+      /\babove\b/i,
+      /\bsame (project|customer|zone|stage)\b/i,
+      /\b(that|the previous|the last) one\b/i,
+      /\bagain\b/i,
+      /\bwhat about\b/i,
+      /\bcompare it\b/i,
+    ];
+
+    const isFollowUpQuestion = (question: string): boolean =>
+      FOLLOW_UP_PATTERNS.some((p) => p.test(question));
+
+    const PRONOUN_REGEX = /\b(its|it|that|this|above)\b/gi;
+
+    const resolveMemoryEntities = (
+      question: string,
+      structured: ConversationMemoryState["structured"],
+    ): string => {
+      if (!structured.currentProject) return question;
+      if (!isFollowUpQuestion(question)) return question;
+
+      return question.replace(PRONOUN_REGEX, (match) => {
+        if (match.toLowerCase() === "its") {
+          return `project ${structured.currentProject}'s`;
+        }
+        return `project ${structured.currentProject}`;
+      });
+    };
+
+    const rewriteMemoryQuestion = (
+      resolvedQuestion: string,
+      structured: ConversationMemoryState["structured"],
+    ): string => {
+      let rewritten = resolvedQuestion;
+      if (structured.currentStage && /\bthere\b/i.test(rewritten)) {
+        rewritten = rewritten.replace(/\bthere\b/i, `in the ${structured.currentStage} stage`);
+      }
+      return rewritten;
+    };
+
+    const MEMORY_FIELD_KEYWORDS: Record<string, RegExp> = {
+      cost: /\bcost|budget|price|expense|boq\b/i,
+      manager: /\bmanager|owner|lead\b/i,
+      phase: /\bphase|stage\b/i,
+      timeline: /\btimeline|duration|days|schedule\b/i,
+      delay: /\bdelay(ed)?\b/i,
+      customer: /\bcustomer|client\b/i,
+    };
+
+    const extractMemoryEntities = (
+      text: string,
+      structured: ConversationMemoryState["structured"],
+    ): ConversationMemoryState["structured"] => {
+      const updated = { ...structured };
+
+      const projectMatch = text.match(/\b(\d{6,})\b/);
+      if (projectMatch) {
+        const code = projectMatch[1];
+        if (updated.currentProject !== code) {
+          updated.currentProject = code;
+          updated.recentProjects = [
+            code,
+            ...updated.recentProjects.filter((p) => p !== code),
+          ].slice(0, MEMORY_MAX_RECENT_PROJECTS);
+        }
+      }
+
+      const zoneMatch = text.match(/\b(north|south|east|west)\b/i);
+      if (zoneMatch) {
+        updated.currentZone =
+          zoneMatch[0][0].toUpperCase() + zoneMatch[0].slice(1).toLowerCase();
+      }
+
+      // Reuse the existing extractors so values stay consistent with the
+      // rest of the pipeline (e.g. "Execution", "InProgress").
+      const stageMatch = extractStage(text);
+      if (stageMatch) updated.currentStage = stageMatch;
+
+      const statusMatch = extractStatus(text);
+      if (statusMatch) updated.currentStatus = statusMatch;
+
+      for (const [field, pattern] of Object.entries(MEMORY_FIELD_KEYWORDS)) {
+        if (pattern.test(text)) {
+          updated.lastTopic = field;
+          if (!updated.discussedFields.includes(field)) {
+            updated.discussedFields = [...updated.discussedFields, field];
+          }
+        }
+      }
+
+      return updated;
     };
 
     // ============ 7. INTENT DETECTION (UPDATED) ============
@@ -2601,6 +2729,67 @@ Question: "${question}"`,
       return { embedding };
     };
 
+    // === HYBRID MEMORY: resolve follow-ups before intent/retrieval ===
+    const memoryResolveNode = async (state: GraphState) => {
+      const memory = state.conversationMemory ?? createEmptyConversationMemory();
+      const wasFollowUp = isFollowUpQuestion(state.question);
+
+      const resolved = wasFollowUp
+        ? resolveMemoryEntities(state.question, memory.structured)
+        : state.question;
+
+      const finalQuestion = wasFollowUp
+        ? rewriteMemoryQuestion(resolved, memory.structured)
+        : resolved;
+
+      if (wasFollowUp && finalQuestion !== state.question) {
+        console.log(`🧠 Memory resolved follow-up: "${state.question}" → "${finalQuestion}"`);
+      }
+
+      return {
+        originalQuestion: state.question,
+        question: finalQuestion,
+        isFollowUp: wasFollowUp,
+        conversationMemory: memory,
+      };
+    };
+
+    // === HYBRID MEMORY: update structured memory + rolling summary ===
+    const memoryUpdateNode = async (state: GraphState) => {
+      const memory = state.conversationMemory ?? createEmptyConversationMemory();
+      const userMessage = state.originalQuestion || state.question;
+      const assistantMessage = state.answer || state.result || "";
+
+      const structured = extractMemoryEntities(
+        `${userMessage} ${assistantMessage}`,
+        memory.structured,
+      );
+
+      const turnCount = memory.turnCount + 1;
+      let summary = memory.summary;
+
+      if (turnCount > 0 && turnCount % MEMORY_SUMMARIZE_EVERY_N_TURNS === 0) {
+        try {
+          const summaryResponse = await this.model.invoke([
+            new SystemMessage(
+              "Summarize this conversation turn in under 40 words, focused on which project/customer is being discussed and what was just answered. Return ONLY the summary text, no preamble.",
+            ),
+            new HumanMessage(
+              `Previous summary: ${summary || "(none)"}\nLatest question: ${userMessage}\nLatest answer: ${assistantMessage}`,
+            ),
+          ]);
+          summary = summaryResponse.content.toString().trim();
+          console.log("🧠 Conversation summary updated:", summary);
+        } catch (error) {
+          console.error("❌ Memory summarization error:", error);
+        }
+      }
+
+      return {
+        conversationMemory: { structured, summary, turnCount },
+      };
+    };
+
     const retrieveContext = async (state: GraphState) => {
       try {
         const questionsToProcess = (state.subQuestions && state.subQuestions.length > 0
@@ -3289,6 +3478,7 @@ Question: "${question}"`,
     const workflow = new StateGraph(GraphAnnotation)
       .addNode("guardrail", guardrailNode)
       .addNode("cacheCheck", cacheCheckNode)
+      .addNode("memoryResolve", memoryResolveNode)
       .addNode("normalize", normalizeQuery)
       .addNode("embeddings", generateEmbedding)
       .addNode("retrieve", retrieveContext)
@@ -3301,16 +3491,18 @@ Question: "${question}"`,
       .addNode("schedule", scheduleAgent)
       .addNode("aggregation", aggregationAgent)
       .addNode("finalize", finalizeAnswer)
+      .addNode("memoryUpdate", memoryUpdateNode)
       .addNode("saveCache", saveCache)
       .addEdge(START, "guardrail")
       .addConditionalEdges("guardrail", (s) => (s.blocked ? END : "cacheCheck"), {
         cacheCheck: "cacheCheck",
         [END]: END,
       })
-      .addConditionalEdges("cacheCheck", (s) => (s.cached ? END : "normalize"), {
-        normalize: "normalize",
+      .addConditionalEdges("cacheCheck", (s) => (s.cached ? END : "memoryResolve"), {
+        memoryResolve: "memoryResolve",
         [END]: END,
       })
+      .addEdge("memoryResolve", "normalize")
       .addEdge("normalize", "embeddings")
       .addEdge("embeddings", "retrieve")
       .addEdge("retrieve", "supervisor")
@@ -3330,7 +3522,8 @@ Question: "${question}"`,
       .addEdge("zone_analysis", "finalize")
       .addEdge("schedule", "finalize")
       .addEdge("aggregation", "finalize")
-      .addEdge("finalize", "saveCache")
+      .addEdge("finalize", "memoryUpdate")
+      .addEdge("memoryUpdate", "saveCache")
       .addEdge("saveCache", END);
 
     const memory = new MemorySaver();
