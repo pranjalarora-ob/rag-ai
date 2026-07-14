@@ -21,6 +21,8 @@ import { GuardrailService } from './guardrail.service';
 import { SemanticCacheService } from './semantic-cache.service';
 import { PlannerService } from './planner.service';
 import { ProjectAgentService } from './project-agent.service';
+import { ProjectAnalyticsService } from './project-analytics.service';
+import { ProjectFlowService } from './project-flow.service';
 import { SYSTEM_PROMPT, COLLECTION } from './constants';
 import { ChatService } from '../chat/chat.service';
 import axios from 'axios';
@@ -87,15 +89,17 @@ export class AgentGraphService {
     private readonly qdrant: QdrantService,
     private readonly rerank: RerankService,
     private readonly guardrail: GuardrailService,
-    private readonly semanticCache: SemanticCacheService,
+    private readonly semanticCache: SemanticCacheService, 
     private readonly planner: PlannerService,
     private readonly projectAgent: ProjectAgentService,
+    private readonly projectAnalytics: ProjectAnalyticsService,
+    private readonly projectFlow: ProjectFlowService,
     private readonly chatService: ChatService,
     private readonly configService: ConfigService,
     
   ) {
     this.graph = this.buildGraph();
-    this.OPEN_ROUTER_API_KEY = this.configService.get('OPEN_ROUTER_KEY') || '';
+    this.OPEN_ROUTER_API_KEY = this.configService.get('OPEN_ROUTER_API_KEY') || '';
     this.GEMINI_API_KEY = this.configService.get('GEMINI_API_KEY') || '';
     // V10 runs on Gemini. Only build the model + V10 graph when a key is configured —
     // ChatGoogleGenerativeAI throws at construction without one, which would otherwise
@@ -254,19 +258,25 @@ export class AgentGraphService {
     this.chatService.addMessage(activeSessionId, 'user', params.question).catch(() => {});
 
     let answer: string;
+    let route = 'v10';
+    let trace: AgentGraphResult['trace'] = [];
+    let cached = false;
     const canned = this.identityAnswer(params.question, params.userName) ?? this.smallTalkAnswer(params.question);
     if (canned) {
       answer = canned;
     } else {
       const final = await this.graphV10.invoke(
-        { question: params.question, customerId: params.customerId },
+        { question: params.question, customerId: params.customerId, userName: params.userName ?? '' },
         { configurable: { thread_id: crypto.randomUUID() } },
       );
-      answer = (final as any).result ?? (final as any).answer ?? 'I could not complete the request.';
+      answer = (final as any).answer ?? (final as any).result ?? 'I could not complete the request.';
+      route = (final as any).route ?? 'v10';
+      trace = (final as any).trace ?? [];
+      cached = !!(final as any).cached;
     }
 
     this.chatService.addMessage(activeSessionId, 'assistant', answer).catch(() => {});
-    return { answer, route: 'v10', trace: [], cached: false, sessionId: activeSessionId };
+    return { answer, route, trace, cached, sessionId: activeSessionId };
   }
 
   /** Streaming variant of the V10 graph — mirrors runStream()'s chunked output. */
@@ -818,10 +828,7 @@ Question: "${question}"`,
   }
 
   private agentGraphV10() {
-    // agentGraphV10 is intentionally self-contained: all workflow helpers remain local to this method.
-    // NEW IN V10: "aggregation" route — for count/breakdown/compare/trend questions that need
-    // the FULL matching dataset (via Qdrant scroll), not a top-k similarity search.
-    // ============ 1. GRAPH ANNOTATION ============
+
 
     const GraphAnnotation = Annotation.Root({
       messages: Annotation<BaseMessage[]>({
@@ -831,6 +838,7 @@ Question: "${question}"`,
       normalizedQuestion: Annotation<string>(),
       embedding: Annotation<number[]>(),
       route: Annotation<string>(),
+      userName: Annotation<string>(), 
       customerId: Annotation<string>(),
       context: Annotation<string>(),
       summary: Annotation<string>(),
@@ -839,6 +847,11 @@ Question: "${question}"`,
       flowAnalysis: Annotation<string>(),
       aggregationResult: Annotation<string>(),
       result: Annotation<string>(),
+      answer: Annotation<string>(),
+      blocked: Annotation<boolean>(),
+      cached: Annotation<boolean>(),
+      cacheEmbedding: Annotation<number[]>(),
+      trace: Annotation<Array<{ tool: string; args: any; result?: any }>>(),
       metadata: Annotation<any>(),
       subQuestions: Annotation<string[]>(),
     });
@@ -886,13 +899,61 @@ Question: "${question}"`,
       return [normalizedQuestion];
     };
 
+    const guardrailNode = async (state: GraphState) => {
+      if (this.guardrail.isAbusive(state.question)) {
+        console.log('🛡️ Guardrail: abusive language blocked');
+        return {
+          blocked: true,
+          answer: "I'd like to keep our conversation respectful. I'm happy to help with any questions about your projects — their details, stages, schedules, or numbers.",
+          result: "I'd like to keep our conversation respectful. I'm happy to help with any questions about your projects — their details, stages, schedules, or numbers.",
+        };
+      }
+
+      if (this.guardrail.isOutOfScopeAction(state.question)) {
+        console.log('🛡️ Guardrail: out-of-scope action blocked');
+        return {
+          blocked: true,
+          answer: "That's outside what I can do — I'm a read-only assistant for looking up project information (details, counts, stages, schedules, leads). I can't create, edit, or delete records. Please use the Workbench for that.",
+          result: "That's outside what I can do — I'm a read-only assistant for looking up project information (details, counts, stages, schedules, leads). I can't create, edit, or delete records. Please use the Workbench for that.",
+        };
+      }
+
+      if (this.guardrail.isPolicyViolation(state.question)) {
+        console.log('🛡️ Guardrail: policy violation blocked');
+        return {
+          blocked: true,
+          answer: 'This request cannot be processed as it violates company policy.',
+          result: 'This request cannot be processed as it violates company policy.',
+        };
+      }
+
+      return { blocked: false };
+    };
+
+    const cacheCheckNode = async (state: GraphState) => {
+      const cache = await this.semanticCache.check(state.question, state.customerId);
+      if (cache?.answer) {
+        return {
+          cached: true,
+          answer: cache.answer,
+          result: cache.answer,
+          cacheEmbedding: cache.embedding,
+        };
+      }
+      return {
+        cached: false,
+        cacheEmbedding: cache?.embedding ?? [],
+      };
+    };
+
     type RouteType =
       | "rag"
       | "summary"
       | "cost"
       | "zone_analysis"
       | "flow_analysis"
-      | "aggregation";
+      | "aggregation"
+      | "schedule";
 
     // ============ NEW: AGGREGATION DETECTION ============
     // Catches "how many", "count of", "which zone has the most", "zone-wise",
@@ -941,6 +1002,110 @@ Question: "${question}"`,
       return { groupBy, metric, extraFilters };
     };
 
+    const extractProjectCode = (question: string): string | null => {
+      const m = question.match(/\b(\d{6,})\b/);
+      if (m) return m[1];
+      return null;
+    };
+
+    const buildScheduleBlock = (name: string, code: string, phases: any[]): string => {
+      const clean = {
+        code,
+        name,
+        phases: phases.map((p) => ({
+          name: p.name,
+          code: p.code || undefined,
+          status: p.status || null,
+          sequence: p.sequence,
+          startDate: p.startDate || null,
+          endDate: p.endDate || null,
+          milestones: (Array.isArray(p.milestones) ? p.milestones : [])
+            .slice()
+            .sort((a: any, b: any) => (Number(a.sequence) || 0) - (Number(b.sequence) || 0))
+            .map((m: any) => ({
+              name: m.name,
+              status: m.status || null,
+              sequence: m.sequence,
+              startDate: m.startDate || null,
+              endDate: m.endDate || null,
+            })),
+        })),
+      };
+      return '```project-schedule\n' + JSON.stringify(clean) + '\n```';
+    };
+
+    const runV10PrecisionPlanner = async (question: string, customerId: string, userName?: string) => {
+      const q = (question || '').trim();
+      if (!q) return '';
+
+      const lower = q.toLowerCase();
+      const hasCode = /\b(\d{6,})\b/.test(q);
+      const firstPerson = /\b(my|me|mine|i)\b/i.test(q);
+      const analyticsIntent = /\b(total|sum|average|avg|count|how many|top\s*\d+|highest|lowest|most|least|compare|breakdown|group|chart|graph|pie|bar|zone-wise|city-wise|owner-wise|gm|per gm|trend|last\s+\d+|unassigned|active|lead|project|value|cost|boq|area|estimated|budget|overdue|pending|stuck|behind schedule|funnel|milestone|timeline|phase|stage|substage|workflow)\b/i.test(lower);
+      const flowIntent = /\b(milestone|milestones|pending payment|payment due|overdue|due in|due within|behind schedule|stuck|handover|mobilization|mobilisation|site kick|funnel|phase|stage|substage|workflow|timeline|schedule|progress)\b/i.test(lower);
+
+      if (hasCode) {
+        const code = q.match(/\b(\d{6,})\b/)?.[1];
+        if (code) {
+          const result = await this.projectFlow.analyze({ customerId, operation: 'listProjects', projectCode: code });
+          if (result?.rows?.length) {
+            return `Project ${code} flow summary:\n${JSON.stringify(result.rows[0], null, 2)}`;
+          }
+        }
+      }
+
+      if (flowIntent && !analyticsIntent) {
+        const args: any = { customerId, operation: 'listProjects' };
+        if (/overdue|behind schedule|due in|due within|pending payment|payment due/.test(lower)) {
+          args.overdue = /overdue|behind schedule/.test(lower);
+          if (/next|within|in\s+\d+/.test(lower)) {
+            const n = lower.match(/\b(\d+)\b/);
+            if (n) args.dueWithinDays = Number(n[1]);
+          }
+        }
+        if (/pending|not completed|not started/.test(lower)) args.milestoneStatus = 'PENDING';
+        if (/completed/.test(lower)) args.milestoneStatus = 'COMPLETED';
+        const result = await this.projectFlow.analyze(args);
+        return JSON.stringify(result, null, 2);
+      }
+
+      if (analyticsIntent) {
+        const args: any = { customerId };
+        if (firstPerson && /project|projects|lead|leads/.test(lower)) {
+          args.teamMember = userName || '';
+        }
+        if (/area|sqft|size/.test(lower)) args.metric = 'area';
+        else if (/boq|cost|budget|value|amount|financial/.test(lower)) args.metric = 'boqValue';
+        else args.metric = 'estimatedValue';
+        if (/top\s*(\d+)/i.test(lower)) {
+          const m = lower.match(/top\s*(\d+)/i);
+          args.topN = Number(m?.[1] || 10);
+        }
+        if (/group|breakdown|by (zone|city|owner|stage|status)|zone-wise|city-wise|owner-wise|gm-wise/.test(lower)) {
+          const groupByMap: Record<string, string> = {
+            zone: 'zone',
+            city: 'city',
+            owner: 'owner',
+            stage: 'stage',
+            status: 'projectStatus',
+            gm: 'owner',
+          };
+          const matched = Object.keys(groupByMap).find((k) => lower.includes(k));
+          if (matched) args.groupBy = groupByMap[matched];
+        }
+        if (/team member|gm|owner|general manager/.test(lower)) args.role = 'General Manager';
+        if (hasCode) {
+          const code = q.match(/\b(\d{6,})\b/)?.[1];
+          if (code) args.projectCodes = [code];
+        }
+        const result = await this.projectAnalytics.analyze(args);
+        return JSON.stringify(result, null, 2);
+      }
+
+      const result = await this.projectAnalytics.analyze({ customerId, metric: 'estimatedValue' });
+      return JSON.stringify(result, null, 2);
+    };
+
     const classifyRoute = (question: string): RouteType => {
       const normalizedQuestion = normalizeQuestionText(question);
       const lowerQuestion = normalizedQuestion.toLowerCase();
@@ -950,6 +1115,13 @@ Question: "${question}"`,
       // counting/grouping questions, not single-project lookups.
       if (AGGREGATION_PATTERNS.test(lowerQuestion)) {
         return "aggregation";
+      }
+
+      const scheduleIntent = /\b(schedule|timeline|road ?map|workflow|project flow|phases?|milestones?)\b/i.test(normalizedQuestion);
+      const hasProjectCode = /\b(\d{6,})\b/.test(normalizedQuestion);
+
+      if (scheduleIntent && hasProjectCode) {
+        return "schedule";
       }
 
       const flowIntent = extractFlowIntent(normalizedQuestion);
@@ -1005,6 +1177,10 @@ Question: "${question}"`,
 
       if (candidateRoutes.includes("aggregation")) {
         return "aggregation";
+      }
+
+      if (candidateRoutes.includes("schedule")) {
+        return "schedule";
       }
 
       if (candidateRoutes.includes("flow_analysis")) {
@@ -1591,13 +1767,13 @@ Question: "${question}"`,
 
     const organizeChunksByType = (chunks: any[]): Record<string, any[]> => {
       const organized: Record<string, any[]> = {
-        details: [],
+        project: [],
         flow: [],
         financial: [],
       };
 
       chunks.forEach((chunk) => {
-        const docType = chunk.payload?.docType || "details";
+        const docType = chunk.payload?.docType === 'project-flow-phase' ? 'flow' : chunk.payload?.docType || 'project';
         if (!organized[docType]) {
           organized[docType] = [];
         }
@@ -1693,22 +1869,7 @@ Question: "${question}"`,
 
       console.log("📊 Aggregation filters:", JSON.stringify(mustFilters));
 
-      const allPoints: any[] = [];
-      let offset: number | undefined | null = undefined;
-
-      do {
-        const page: any = await this.qdrant.scrollAll("collection_gemini", {
-          filter: { must: mustFilters },
-          limit: 250,
-          offset: offset ?? undefined,
-          with_payload: true,
-          with_vector: false,
-        });
-
-        const points = page?.points || page?.result?.points || [];
-        allPoints.push(...points);
-        offset = page?.next_page_offset ?? page?.result?.next_page_offset ?? null;
-      } while (offset);
+      const allPoints: any[] = await this.qdrant.scrollAll(COLLECTION, { must: mustFilters }, 250);
 
       console.log(`📊 Aggregation scrolled ${allPoints.length} total records`);
 
@@ -2410,6 +2571,12 @@ Question: "${question}"`,
         not a sample. Report these numbers precisely as given. Do not estimate, round differently,
         or hedge on the numbers themselves. You may add brief interpretive commentary (e.g. which
         group is highest/lowest) but the figures must match the context exactly.`,
+
+        schedule: `${basePrompt}
+ 
+        For project schedule questions, provide the project timeline in a clear, structured way.
+        Use the provided project-flow phases and milestones directly, and keep the answer factual.
+        If the project code is missing or no schedule data is available, say so clearly.`,
       };
 
       return prompts[intentType] || basePrompt;
@@ -2731,6 +2898,10 @@ Question: "${question}"`,
         - e.g. "How many active projects in each zone?", "Which zone has the most projects stuck in design stage?",
               "Zone-wise count of projects pending milestone payment", "City-wise average project timeline"
 
+        schedule
+        - Project timeline, workflow, phases, milestones, or schedule details for a specific project
+        - e.g. "Show schedule for project 123456", "What are the milestones for project 123456?"
+
         IMPORTANT:
         - Questions mentioning "stage", "substage", "phase", "milestone", "timeline", or "progress" for a SPECIFIC project ALWAYS go to flow_analysis.
         - Questions asking "how many", "count of", "which zone/city has the most", or any zone-wise/city-wise breakdown ALWAYS go to aggregation, even if they also mention stage/cost/zone words.
@@ -2739,7 +2910,7 @@ Question: "${question}"`,
         new HumanMessage(state.question),
       ]);
 
-      const VALID_ROUTES = ["rag", "summary", "cost", "zone_analysis", "flow_analysis", "aggregation"];
+      const VALID_ROUTES = ["rag", "summary", "cost", "zone_analysis", "flow_analysis", "aggregation", "schedule"];
 
       const rawRoute = response.content;
       let route = "";
@@ -2844,6 +3015,15 @@ Question: "${question}"`,
       try {
         console.log("💰 Cost Agent processing...");
 
+        const precisionAnswer = await runV10PrecisionPlanner(state.question, state.customerId, state.userName);
+        if (precisionAnswer?.trim()) {
+          return {
+            costAnalysis: precisionAnswer,
+            result: precisionAnswer,
+            messages: [],
+          };
+        }
+
         const compoundInstruction = (state.subQuestions?.length || 0) > 1
           ? "\nThe user asked multiple questions in one prompt. Answer each sub-question separately and clearly. If any part cannot be answered from the context, say that explicitly rather than guessing."
           : "";
@@ -2876,6 +3056,15 @@ Question: "${question}"`,
     const flowAnalysisAgent = async (state: GraphState) => {
       try {
         console.log("🗺️ Flow Analysis Agent processing...");
+
+        const precisionAnswer = await runV10PrecisionPlanner(state.question, state.customerId, state.userName);
+        if (precisionAnswer?.trim()) {
+          return {
+            flowAnalysis: precisionAnswer,
+            result: precisionAnswer,
+            messages: [],
+          };
+        }
 
         const compoundInstruction = (state.subQuestions?.length || 0) > 1
           ? "\nThe user asked multiple questions in one prompt. Answer each sub-question separately and clearly. If any part cannot be answered from the context, say that explicitly rather than guessing."
@@ -2910,6 +3099,15 @@ Question: "${question}"`,
       try {
         console.log("🗺️ Zone Analysis Agent processing...");
 
+        const precisionAnswer = await runV10PrecisionPlanner(state.question, state.customerId, state.userName);
+        if (precisionAnswer?.trim()) {
+          return {
+            zoneAnalysis: precisionAnswer,
+            result: precisionAnswer,
+            messages: [],
+          };
+        }
+
         const compoundInstruction = (state.subQuestions?.length || 0) > 1
           ? "\nThe user asked multiple questions in one prompt. Answer each sub-question separately and clearly. If any part cannot be answered from the context, say that explicitly rather than guessing."
           : "";
@@ -2939,6 +3137,61 @@ Question: "${question}"`,
       }
     };
 
+    const scheduleAgent = async (state: GraphState) => {
+      try {
+        console.log("🗓️ Schedule Agent processing...");
+
+        const code = extractProjectCode(state.question);
+        if (!code) {
+          return {
+            result: 'Which project would you like the schedule for? Please include its project code.',
+            messages: [],
+          };
+        }
+
+        const must: any[] = [
+          { key: 'customerId', match: { value: state.customerId } },
+          { key: 'docType', match: { value: 'project-flow-phase' } },
+        ];
+        if (code) {
+          must.push({ key: 'projectCode', match: { value: String(code) } });
+        }
+
+        const points = await this.qdrant.scrollAll(COLLECTION, { must }, 100);
+
+        const phases: any[] = [];
+        const seen = new Set<string>();
+        for (const point of points || []) {
+          const payload: any = point.payload || {};
+          const id = payload.phaseId || payload.original_id;
+          if (id && seen.has(id)) continue;
+          if (id) seen.add(id);
+          phases.push(payload);
+        }
+
+        if (!phases.length) {
+          return {
+            result: `No project schedule found for project ${code}.`,
+            messages: [],
+          };
+        }
+
+        phases.sort((a, b) => (Number(a.sequence) || 0) - (Number(b.sequence) || 0));
+        const name = phases[0].projectName || `Project ${code}`;
+
+        return {
+          result: buildScheduleBlock(name, code, phases),
+          messages: [],
+        };
+      } catch (error) {
+        console.error('❌ Schedule Agent error:', error);
+        return {
+          result: `Error: ${String(error)}`,
+          messages: [],
+        };
+      }
+    };
+
     // ============ NEW: AGGREGATION AGENT ============
     // Context was already computed exactly (via scroll) in retrieveContext;
     // this node just asks the LLM to phrase the exact numbers in words.
@@ -2946,6 +3199,15 @@ Question: "${question}"`,
     const aggregationAgent = async (state: GraphState) => {
       try {
         console.log("📊 Aggregation Agent processing...");
+
+        const precisionAnswer = await runV10PrecisionPlanner(state.question, state.customerId, state.userName);
+        if (precisionAnswer?.trim()) {
+          return {
+            aggregationResult: precisionAnswer,
+            result: precisionAnswer,
+            messages: [],
+          };
+        }
 
         const compoundInstruction = (state.subQuestions?.length || 0) > 1
           ? "\nThe user asked multiple questions in one prompt. Answer each sub-question separately and clearly. If any part cannot be answered from the context, say that explicitly rather than guessing."
@@ -2976,25 +3238,27 @@ Question: "${question}"`,
       }
     };
 
+    const finalizeAnswer = async (state: GraphState) => {
+      const answer = state.answer || state.result || state.summary || state.costAnalysis || state.zoneAnalysis || state.flowAnalysis || state.aggregationResult || '';
+      return {
+        answer,
+        result: answer,
+        trace: [] as Array<{ tool: string; args: any; result?: any }>,
+      };
+    };
+
     const saveCache = async (state: GraphState) => {
-      if (!state.result) {
+      if (state.cached || state.blocked || !state.result) {
+        return {};
+      }
+
+      const embedding = state.cacheEmbedding?.length ? state.cacheEmbedding : state.embedding;
+      if (!embedding?.length) {
         return {};
       }
 
       try {
-        await this.qdrant.upsert("chat_cache", [
-          {
-            id: crypto.randomUUID(),
-            vector: state.embedding,
-            payload: {
-              question: state.question,
-              normalizedQuestion: state.normalizedQuestion,
-              answer: state.result,
-              customerId: state.customerId,
-              createdAt: new Date().getTime(),
-            },
-          },
-        ]);
+        await this.semanticCache.save(state.question, embedding, state.result, state.customerId);
         console.log("✅ Response cached");
       } catch (error) {
         console.error("❌ Cache save error:", error);
@@ -3023,6 +3287,8 @@ Question: "${question}"`,
     // ============ 13. BUILD WORKFLOW ============
 
     const workflow = new StateGraph(GraphAnnotation)
+      .addNode("guardrail", guardrailNode)
+      .addNode("cacheCheck", cacheCheckNode)
       .addNode("normalize", normalizeQuery)
       .addNode("embeddings", generateEmbedding)
       .addNode("retrieve", retrieveContext)
@@ -3032,9 +3298,19 @@ Question: "${question}"`,
       .addNode("cost", costAgent)
       .addNode("flow_analysis", flowAnalysisAgent)
       .addNode("zone_analysis", zoneAnalysisAgent)
+      .addNode("schedule", scheduleAgent)
       .addNode("aggregation", aggregationAgent)
+      .addNode("finalize", finalizeAnswer)
       .addNode("saveCache", saveCache)
-      .addEdge(START, "normalize")
+      .addEdge(START, "guardrail")
+      .addConditionalEdges("guardrail", (s) => (s.blocked ? END : "cacheCheck"), {
+        cacheCheck: "cacheCheck",
+        [END]: END,
+      })
+      .addConditionalEdges("cacheCheck", (s) => (s.cached ? END : "normalize"), {
+        normalize: "normalize",
+        [END]: END,
+      })
       .addEdge("normalize", "embeddings")
       .addEdge("embeddings", "retrieve")
       .addEdge("retrieve", "supervisor")
@@ -3045,13 +3321,16 @@ Question: "${question}"`,
         flow_analysis: "flow_analysis",
         zone_analysis: "zone_analysis",
         aggregation: "aggregation",
+        schedule: "schedule",
       })
-      .addEdge("rag", "saveCache")
-      .addEdge("summaryV1", "saveCache")
-      .addEdge("cost", "saveCache")
-      .addEdge("flow_analysis", "saveCache")
-      .addEdge("zone_analysis", "saveCache")
-      .addEdge("aggregation", "saveCache")
+      .addEdge("rag", "finalize")
+      .addEdge("summaryV1", "finalize")
+      .addEdge("cost", "finalize")
+      .addEdge("flow_analysis", "finalize")
+      .addEdge("zone_analysis", "finalize")
+      .addEdge("schedule", "finalize")
+      .addEdge("aggregation", "finalize")
+      .addEdge("finalize", "saveCache")
       .addEdge("saveCache", END);
 
     const memory = new MemorySaver();
