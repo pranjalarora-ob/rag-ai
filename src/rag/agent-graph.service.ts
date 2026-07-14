@@ -75,8 +75,11 @@ type GraphState = typeof GraphState.State;
 @Injectable()
 export class AgentGraphService {
   private readonly graph: ReturnType<AgentGraphService['buildGraph']>;
+  // Optional: only built when GEMINI_API_KEY is present, so a missing key never
+  // crashes the live app on boot.
+  private readonly graphV10?: ReturnType<AgentGraphService['agentGraphV10']>;
   private readonly OPEN_ROUTER_API_KEY: string;
-  private readonly model: ChatGoogleGenerativeAI;
+  private readonly model!: ChatGoogleGenerativeAI;
   private readonly GEMINI_API_KEY: string;
 
   constructor(
@@ -93,14 +96,21 @@ export class AgentGraphService {
   ) {
     this.graph = this.buildGraph();
     this.OPEN_ROUTER_API_KEY = this.configService.get('OPEN_ROUTER_KEY') || '';
-    this.model = new ChatGoogleGenerativeAI({
-      model: 'gemini-2.5-flash',
-      apiKey: this.GEMINI_API_KEY,
-      // temperature: 0.7,
-      temperature: 0.2,
-      maxOutputTokens: 2048,
-    });
     this.GEMINI_API_KEY = this.configService.get('GEMINI_API_KEY') || '';
+    // V10 runs on Gemini. Only build the model + V10 graph when a key is configured —
+    // ChatGoogleGenerativeAI throws at construction without one, which would otherwise
+    // crash the whole service (and take down the live /agent-graph routes too).
+    if (this.GEMINI_API_KEY) {
+      this.model = new ChatGoogleGenerativeAI({
+        model: 'gemini-2.5-flash',
+        apiKey: this.GEMINI_API_KEY,
+        temperature: 0.2,
+        maxOutputTokens: 2048,
+      });
+      this.graphV10 = this.agentGraphV10();
+    } else {
+      console.warn('[AgentGraph] GEMINI_API_KEY not set — V10 endpoints are disabled (live graph unaffected).');
+    }
   }
 
   // ============ Public API ============
@@ -201,6 +211,78 @@ export class AgentGraphService {
     if (sessionId) {
       res.setHeader('x-session-id', sessionId);
     }
+    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.flushHeaders?.();
+
+    const tokens = answer.split(/(\s+)/);
+    for (let i = 0; i < tokens.length; i += 3) {
+      if (res.writableEnded) break;
+      res.write(tokens.slice(i, i + 3).join(''));
+      (res as any).flush?.();
+      await new Promise((r) => setTimeout(r, 6));
+    }
+    if (!res.writableEnded) res.end();
+  }
+
+  // ============ V10 (experimental) — separate from the live graph ============
+
+  /**
+   * Run the experimental V10 graph (Gemini generation + full-dataset aggregation).
+   * Kept fully separate from run()/runStream() so the live version is never affected.
+   * Persists to chat history the same way; returns the final answer text.
+   */
+  async runV10(params: {
+    question: string;
+    customerId: string;
+    sessionId?: string;
+    userName?: string;
+  }): Promise<AgentGraphResult> {
+    if (!this.graphV10) {
+      return {
+        answer: 'V10 is not configured on this environment (missing GEMINI_API_KEY). The standard assistant is available at /rag/agent-graph.',
+        route: 'v10-disabled',
+        trace: [],
+        cached: false,
+      };
+    }
+    let activeSessionId = params.sessionId;
+    if (!activeSessionId) {
+      const session = await this.chatService.createSession(params.customerId, params.question);
+      activeSessionId = (session as any)._id.toString();
+    }
+    this.chatService.addMessage(activeSessionId, 'user', params.question).catch(() => {});
+
+    let answer: string;
+    const canned = this.identityAnswer(params.question, params.userName) ?? this.smallTalkAnswer(params.question);
+    if (canned) {
+      answer = canned;
+    } else {
+      const final = await this.graphV10.invoke(
+        { question: params.question, customerId: params.customerId },
+        { configurable: { thread_id: crypto.randomUUID() } },
+      );
+      answer = (final as any).result ?? (final as any).answer ?? 'I could not complete the request.';
+    }
+
+    this.chatService.addMessage(activeSessionId, 'assistant', answer).catch(() => {});
+    return { answer, route: 'v10', trace: [], cached: false, sessionId: activeSessionId };
+  }
+
+  /** Streaming variant of the V10 graph — mirrors runStream()'s chunked output. */
+  async runV10Stream(params: {
+    question: string;
+    customerId: string;
+    sessionId?: string;
+    userName?: string;
+    res: Response;
+    onAnswer?: (answer: string) => void;
+  }): Promise<void> {
+    const { res, onAnswer } = params;
+    const { answer, sessionId } = await this.runV10(params);
+    onAnswer?.(answer);
+
+    if (sessionId) res.setHeader('x-session-id', sessionId);
     res.setHeader('Content-Type', 'text/plain; charset=utf-8');
     res.setHeader('Cache-Control', 'no-cache');
     res.flushHeaders?.();
@@ -708,7 +790,7 @@ Question: "${question}"`,
         {
           model: 'google/gemini-embedding-001',
           input,
-          dimensions: 3072,
+          dimensions: 1536,
           encoding_format: 'float',
         },
         {
@@ -1515,7 +1597,7 @@ Question: "${question}"`,
       };
 
       chunks.forEach((chunk) => {
-        const docType = chunk.payload?.document_type || "details";
+        const docType = chunk.payload?.docType || "details";
         if (!organized[docType]) {
           organized[docType] = [];
         }
@@ -1569,7 +1651,7 @@ Question: "${question}"`,
     }> => {
       const mustFilters: any[] = [
         {
-          key: "document_type",
+          key: "docType",
           match: { value: "details" }, // one "details" chunk per project avoids double counting
         },
       ];
@@ -2476,7 +2558,7 @@ Question: "${question}"`,
           const allowedDocTypes = ["details", "flow", "financial"];
           mustFilters.push({
             should: allowedDocTypes.map((docType) => ({
-              key: "document_type",
+              key: "docType",
               match: { value: docType },
             })),
           });

@@ -206,6 +206,40 @@ export class RagController {
     }
   }
 
+  // ============ Agent graph V10 (experimental — separate from the live version) ============
+
+  @ApiOperation({ summary: 'Agent graph V10 (experimental) — Gemini + full-dataset aggregation. Non-streaming.' })
+  @Post('agent-graph-v10')
+  agentGraphV10(@Body() body: PlannerDto) {
+    if (!body?.customerId) throw new BadRequestException('customerId is required');
+    return this.agentGraphService.runV10({
+      question: body.question,
+      customerId: body.customerId,
+      sessionId: body.sessionId,
+      userName: body.userName,
+    });
+  }
+
+  @ApiOperation({ summary: 'Agent graph V10 (experimental) — streams the final answer as plain text.' })
+  @ApiProduces('text/event-stream')
+  @Post('agent-graph-v10/stream')
+  async agentGraphV10Stream(@Body() body: PlannerDto, @Res() res: Response) {
+    if (!body?.customerId) throw new BadRequestException('customerId is required');
+    try {
+      await this.agentGraphService.runV10Stream({
+        question: body.question,
+        customerId: body.customerId,
+        sessionId: body.sessionId,
+        userName: body.userName,
+        res,
+      });
+    } catch (err) {
+      console.error(err);
+      if (!res.headersSent) throw new InternalServerErrorException('Agent graph V10 stream failed');
+      if (!res.writableEnded) res.end();
+    }
+  }
+
   // ============ Chat (streaming, with routing) ============
 
   @ApiOperation({ summary: 'Chat — routes aggregate questions to the analytics tool, lookups to RAG. Streams text.' })
