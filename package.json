@@ -11,6 +11,7 @@
   "dependencies": {
     "@aws-sdk/rds-signer": "^3.1068.0",
     "@langchain/core": "^1.2.1",
+    "@langchain/google-genai": "^2.2.0",
     "@langchain/langgraph": "^1.4.7",
     "@nestjs/common": "^10.0.0",
     "@nestjs/config": "^3.0.0",
