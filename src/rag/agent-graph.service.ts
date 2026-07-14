@@ -2051,10 +2051,10 @@ Question: "${question}"`,
         sections.push("");
       }
 
-      if (chunksByType.details && chunksByType.details.length > 0) {
+      if (chunksByType.project && chunksByType.project.length > 0) {
         sections.push("PROJECT TEAM & ROLES");
         sections.push("-".repeat(80));
-        const detailsData = chunksByType.details[0];
+        const detailsData = chunksByType.project[0];
         const detailsText = detailsData.payload?.text || "";
         const roleMatches = detailsText.match(/Role[^\n]*|Manager[^\n]*/g) || [];
         if (roleMatches.length > 0) {
@@ -2084,11 +2084,11 @@ Question: "${question}"`,
       }
       sections.push("");
 
-      if (chunksByType.details && chunksByType.details.length > 0) {
+      if (chunksByType.project && chunksByType.project.length > 0) {
         sections.push("LARGE-AREA PROJECTS:");
         sections.push("-".repeat(80));
 
-        const sorted = [...chunksByType.details].sort((a, b) => {
+        const sorted = [...chunksByType.project].sort((a, b) => {
           const aArea = a.payload?.area || 0;
           const bArea = b.payload?.area || 0;
           return bArea - aArea;
@@ -2150,10 +2150,10 @@ Question: "${question}"`,
         });
       }
 
-      if (chunksByType.details && chunksByType.details.length > 0) {
+      if (chunksByType.project && chunksByType.project.length > 0) {
         sections.push("\nPROJECT DETAILS:");
         sections.push("-".repeat(80));
-        chunksByType.details.forEach((chunk) => {
+        chunksByType.project.forEach((chunk) => {
           const text = chunk.payload?.text || "";
           const boqValue = chunk.payload?.boqValue || 0;
           const relevantLines = text
@@ -2195,10 +2195,10 @@ Question: "${question}"`,
         });
       }
 
-      if (chunksByType.details && chunksByType.details.length > 0) {
+      if (chunksByType.project && chunksByType.project.length > 0) {
         sections.push("PROJECT DETAILS:");
         sections.push("-".repeat(80));
-        chunksByType.details.forEach((chunk) => {
+        chunksByType.project.forEach((chunk) => {
           const text = chunk.payload?.text || "";
           const relevantLines = text
             .split("\n")
@@ -2223,10 +2223,10 @@ Question: "${question}"`,
       sections.push("=".repeat(80));
       sections.push("");
 
-      if (chunksByType.details && chunksByType.details.length > 0) {
+      if (chunksByType.project && chunksByType.project.length > 0) {
         sections.push("PROJECT INFORMATION:");
         sections.push("-".repeat(80));
-        chunksByType.details.forEach((chunk) => {
+        chunksByType.project.forEach((chunk) => {
           sections.push(chunk.payload?.text || "");
         });
         sections.push("");
@@ -2331,10 +2331,10 @@ Question: "${question}"`,
       sections.push("=".repeat(80));
       sections.push("");
 
-      if (chunksByType.details && chunksByType.details.length > 0) {
+      if (chunksByType.project && chunksByType.project.length > 0) {
         sections.push("PROJECT DETAILS:");
         sections.push("-".repeat(80));
-        chunksByType.details.slice(0, 2).forEach((chunk) => {
+        chunksByType.project.slice(0, 2).forEach((chunk) => {
           sections.push(chunk.payload?.text || "");
         });
         sections.push("");
@@ -2574,7 +2574,7 @@ Question: "${question}"`,
                 vector: embedding,
                 limit,
                 filter: filters.length > 0 ? { must: filters } : undefined,
-                score_threshold: 0.5,
+                // score_threshold: 0.5,
               }
             );
 
