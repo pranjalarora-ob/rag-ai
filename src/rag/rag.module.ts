@@ -18,9 +18,11 @@ import { IngestionService } from './ingest/ingestion.service';
 import { PgService } from './ingest/pg.service';
 import { WatermarkStore } from './ingest/watermark.store';
 import { SemanticCacheService } from './semantic-cache.service';
+import { ApiUserModule } from 'src/api/api.module';
+import { WbGuard } from 'src/core/guards/wb-guard.guard';
 
 @Module({
-  imports: [ChatModule],
+  imports: [ChatModule, ApiUserModule],
   controllers: [RagController, IngestionController],
   providers: [
     QdrantService,
@@ -39,6 +41,7 @@ import { SemanticCacheService } from './semantic-cache.service';
     IngestionService,
     PgService,
     WatermarkStore,
+    WbGuard,
   ],
 })
 export class RagModule {}

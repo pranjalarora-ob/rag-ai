@@ -2,6 +2,7 @@ import {
   Controller, Post, Body, Param, Get, Res, Patch,
   BadRequestException, InternalServerErrorException,
   UseInterceptors, UploadedFile,
+  UseGuards,
 } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
 import { ApiOperation, ApiProduces, ApiResponse, ApiTags } from '@nestjs/swagger';
@@ -22,8 +23,10 @@ import { VoiceService } from './voice.service';
 import { SemanticCacheService } from './semantic-cache.service';
 import { SYSTEM_PROMPT, COLLECTION } from './constants';
 import { ChatService } from '../chat/chat.service';
+import { WbGuard } from 'src/core/guards/wb-guard.guard';
 
 @ApiTags('RAG')
+@UseGuards(WbGuard)
 @Controller('rag')
 export class RagController {
   constructor(
