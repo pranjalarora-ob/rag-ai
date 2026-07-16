@@ -1,4 +1,4 @@
-import { Injectable, InternalServerErrorException } from '@nestjs/common';
+import { BadRequestException, Injectable, InternalServerErrorException } from '@nestjs/common';
 import { Response } from 'express';
 import {
   StateGraph,
@@ -26,6 +26,10 @@ import { ChatService } from '../chat/chat.service';
 import axios from 'axios';
 import { ConfigService } from '@nestjs/config';
 import { ChatGoogleGenerativeAI } from '@langchain/google-genai';
+import { ApiEpUser } from 'src/core/interfaces/user.interface';
+import moment from 'moment';
+import { RedisService } from 'src/core/global/redis.service';
+import { randomUUID } from 'crypto';
 
 /**
  * LangGraph multi-agent orchestrator.
@@ -89,6 +93,7 @@ export class AgentGraphService {
     private readonly projectAgent: ProjectAgentService,
     private readonly chatService: ChatService,
     private readonly configService: ConfigService,
+    private readonly redisService: RedisService,
     
   ) {
     this.graph = this.buildGraph();
@@ -234,27 +239,97 @@ export class AgentGraphService {
     history?: Array<{ role: string; content: string }>;
     userName?: string;
     res: Response;
+    by: ApiEpUser;
     onAnswer?: (answer: string) => void;
   }): Promise<void> {
-    const { res, onAnswer } = params;
-    const { answer, sessionId } = await this.run(params);
-    onAnswer?.(answer);
+    const { res, onAnswer, by } = params;
 
-    if (sessionId) {
-      res.setHeader('x-session-id', sessionId);
+    if (!by?.epEmailId) {
+      throw new BadRequestException('Not valid WB user');
     }
-    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
-    res.setHeader('Cache-Control', 'no-cache');
-    res.flushHeaders?.();
 
-    const tokens = answer.split(/(\s+)/);
-    for (let i = 0; i < tokens.length; i += 3) {
-      if (res.writableEnded) break;
-      res.write(tokens.slice(i, i + 3).join(''));
-      (res as any).flush?.();
-      await new Promise((r) => setTimeout(r, 6));
+    // Acquire lock
+    const { lockKey, lockValue } = await this.acquireUserLock(by.epEmailId);
+
+    try {
+      const today = moment().utcOffset('+05:30').format('YYYY-MM-DD');
+      const key = `RAG_HITS:${by.epEmailId}:${today}`;
+
+      const hits = Number((await this.redisService.get(key)) ?? 0);
+
+      if (hits >= 30) {
+        throw new BadRequestException(
+          'Daily RAG limit exceeded (30 hits/day).',
+        );
+      }
+
+      const { answer, sessionId } = await this.run(params);
+
+      const newHits = await this.redisService.incr(key);
+
+      if (newHits === 1) {
+        await this.redisService.expire(key, 25 * 60 * 60);
+      }
+
+      onAnswer?.(answer);
+
+      if (sessionId) {
+        res.setHeader('x-session-id', sessionId);
+      }
+
+      res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+      res.setHeader('Cache-Control', 'no-cache');
+      res.flushHeaders?.();
+
+      const tokens = answer.split(/(\s+)/);
+
+      for (let i = 0; i < tokens.length; i += 3) {
+        if (res.writableEnded) break;
+
+        res.write(tokens.slice(i, i + 3).join(''));
+        (res as any).flush?.();
+
+        await new Promise((r) => setTimeout(r, 6));
+      }
+
+      if (!res.writableEnded) {
+        res.end();
+      }
+    } finally {
+      await this.releaseUserLock(lockKey, lockValue);
     }
-    if (!res.writableEnded) res.end();
+  }
+
+  async acquireUserLock(epEmailId: string): Promise<{
+    lockKey: string;
+    lockValue: string;
+  }> {
+    const lockKey = `RAG_LOCK:${epEmailId}`;
+    const lockValue = randomUUID();
+
+    const acquired = await this.redisService.set(
+      lockKey,
+      lockValue,
+      'PX',
+      60 * 1000, // 60 seconds
+      'NX',
+    );
+
+    if (!acquired) {
+      throw new BadRequestException(
+        'Another RAG request is already in progress.'
+      );
+    }
+
+    return { lockKey, lockValue };
+  }
+
+  async releaseUserLock(lockKey: string, lockValue: string): Promise<void> {
+    const value = await this.redisService.get(lockKey);
+
+    if (value === lockValue) {
+      await this.redisService.del(lockKey);
+    }
   }
 
   // ============ Nodes ============

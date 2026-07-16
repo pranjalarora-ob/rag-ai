@@ -24,6 +24,10 @@ import { SemanticCacheService } from './semantic-cache.service';
 import { SYSTEM_PROMPT, COLLECTION } from './constants';
 import { ChatService } from '../chat/chat.service';
 import { WbGuard } from 'src/core/guards/wb-guard.guard';
+import { RedisService } from 'src/core/global/redis.service';
+import { ApiEpUser } from 'src/core/interfaces/user.interface';
+import { ApiBy } from 'src/core/decorators/api-user.decorator';
+import moment from 'moment';
 
 @ApiTags('RAG')
 @UseGuards(WbGuard)
@@ -42,6 +46,7 @@ export class RagController {
     private readonly voiceService: VoiceService,
     private readonly semanticCache: SemanticCacheService,
     private readonly chatService: ChatService,
+    private readonly redisService: RedisService,
   ) { }
 
   // ============ Voice-to-text (Ringg Parrot STT) ============
@@ -177,21 +182,56 @@ export class RagController {
 
   @ApiOperation({ summary: 'Agent graph — LangGraph multi-agent (guardrail → cache → supervisor → analytics/lookup/search). Returns answer + route + trace.' })
   @Post('agent-graph')
-  agentGraph(@Body() body: PlannerDto) {
-    if (!body?.customerId) throw new BadRequestException('customerId is required');
-    return this.agentGraphService.run({
-      question: body.question,
-      customerId: body.customerId,
-      sessionId: body.sessionId,
-      history: body.history,
-      userName: body.userName,
-    });
+  async agentGraph(@Body() body: PlannerDto, @ApiBy() by: ApiEpUser) {
+    if (!body?.customerId) {
+      throw new BadRequestException('customerId is required');
+    }
+
+    if (!by?.epEmailId) {
+      throw new BadRequestException('Not valid WB user');
+    }
+
+    // Acquire lock
+    const { lockKey, lockValue } = await this.agentGraphService.acquireUserLock(
+      by.epEmailId,
+    );
+
+    try {
+      const today = moment().utcOffset('+05:30').format('YYYY-MM-DD');
+      const key = `RAG_HITS:${by.epEmailId}:${today}`;
+
+      const hits = Number((await this.redisService.get(key)) ?? 0);
+
+      if (hits >= 30) {
+        throw new BadRequestException(
+          'Daily RAG limit exceeded (30 hits/day).',
+        );
+      }
+      
+      const res = await this.agentGraphService.run({
+        question: body.question,
+        customerId: body.customerId,
+        sessionId: body.sessionId,
+        history: body.history,
+        userName: body.userName,
+      });
+
+      const newHits = await this.redisService.incr(key);
+
+      if (newHits === 1) {
+        await this.redisService.expire(key, 25 * 60 * 60);
+      }
+
+      return res;
+    } finally {
+      await this.agentGraphService.releaseUserLock(lockKey, lockValue);
+    }
   }
 
   @ApiOperation({ summary: 'Agent graph (streaming) — same LangGraph multi-agent flow, streams the final answer as plain text.' })
   @ApiProduces('text/event-stream')
   @Post('agent-graph/stream')
-  async agentGraphStream(@Body() body: PlannerDto, @Res() res: Response) {
+  async agentGraphStream(@Body() body: PlannerDto, @Res() res: Response, @ApiBy() by: ApiEpUser) {
     if (!body?.customerId) throw new BadRequestException('customerId is required');
     try {
       await this.agentGraphService.runStream({
@@ -201,6 +241,7 @@ export class RagController {
         history: body.history,
         userName: body.userName,
         res,
+        by
       });
     } catch (err) {
       console.error(err);
