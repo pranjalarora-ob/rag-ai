@@ -9,7 +9,7 @@ export class ChatService {
   constructor(
     @InjectModel(ChatSession.name) private readonly sessionModel: Model<ChatSession>,
     @InjectModel(ChatMessage.name) private readonly messageModel: Model<ChatMessage>,
-  ) {}
+  ) { }
 
   // Create a new session
   async createSession(userId: string, firstQuestion: string): Promise<ChatSession> {
@@ -19,6 +19,12 @@ export class ChatService {
 
     const session = new this.sessionModel({ userId, subject });
     return session.save();
+  }
+
+  private getThreeMonthsAgo() {
+    const date = new Date();
+    date.setMonth(date.getMonth() - 3);
+    return date;
   }
 
   // Save a question/answer message to a session
@@ -33,7 +39,7 @@ export class ChatService {
       role,
       content,
     });
-    
+
     // Update the updated_at timestamp on the session to bubble it up in lists
     await this.sessionModel.updateOne(
       { _id: new Types.ObjectId(sessionId) },
@@ -45,7 +51,27 @@ export class ChatService {
 
   // Get user session list
   async getUserSessions(userId: string): Promise<ChatSession[]> {
-    return this.sessionModel.find({ userId }).sort({ updatedAt: -1 }).exec();
+    return this.sessionModel
+      .find({ userId, createdAt: { $gte: this.getThreeMonthsAgo() } })
+      .sort({ createdAt: -1 })
+      .exec();
+  }
+
+  async getUserSessionHistory(userId: string) {
+
+    const sessions = await this.sessionModel
+      .find({ userId, createdAt: { $gte: this.getThreeMonthsAgo() } })
+      .select('_id subject createdAt updatedAt')
+      .sort({ createdAt: -1 })
+      .lean()
+      .exec();
+
+    return sessions.map((session: any) => ({
+      sessionId: session._id.toString(),
+      subject: session.subject,
+      createdAt: session.createdAt,
+      updatedAt: session.updatedAt,
+    }));
   }
 
   // Get conversation history in order

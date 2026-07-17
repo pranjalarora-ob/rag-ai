@@ -26,6 +26,7 @@ async function bootstrap() {
     .setTitle('RAG AI')
     .setDescription('RAG + Planner agent over project data')
     .setVersion('1.0')
+    .addBearerAuth()
     .build();
   SwaggerModule.setup('docs', app, SwaggerModule.createDocument(app, config));
 

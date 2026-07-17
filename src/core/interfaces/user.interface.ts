@@ -6,6 +6,7 @@ export interface ApiUserBy {
 }
 
 export interface ApiEpUser {
+  userId(userId: any, question: string): unknown;
   id: string;
   name: string;
   emailId: string;

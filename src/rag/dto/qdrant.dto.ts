@@ -6,8 +6,13 @@ class FilterConditionDto {
   @IsString()
   key: string;
 
+  @IsOptional()
   @IsObject()
-  match: { value: string | number | boolean };
+  match?: { value: string | number | boolean };
+
+  @IsOptional()
+  @IsObject()
+  range?: { gt?: number; lt?: number; gte?: number; lte?: number };
 }
 
 class FilterDto {

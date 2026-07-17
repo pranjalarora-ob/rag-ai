@@ -1,11 +1,15 @@
-import { Controller, Get, Post, Delete, Body, Param, Query, NotFoundException } from '@nestjs/common';
-import { ApiTags, ApiOperation, ApiQuery, ApiBody } from '@nestjs/swagger';
+import { Controller, Get, Post, Delete, Body, Param, Query, NotFoundException, UseGuards, Req } from '@nestjs/common';
+import { ApiTags, ApiOperation, ApiQuery, ApiBody, ApiBearerAuth } from '@nestjs/swagger';
 import { ChatService } from './chat.service';
+import { WbGuard } from 'src/core/guards/wb-guard.guard';
+import { Request } from 'express';
 
 @ApiTags('chats')
+@ApiBearerAuth()
+@UseGuards(WbGuard)
 @Controller('chats')
 export class ChatController {
-  constructor(private readonly chatService: ChatService) {}
+  constructor(private readonly chatService: ChatService) { }
 
   @ApiOperation({ summary: 'Create a new chat session' })
   @ApiBody({ schema: { properties: { userId: { type: 'string' }, firstQuestion: { type: 'string' } } } })
@@ -33,6 +37,13 @@ export class ChatController {
   @Get()
   async getSessions(@Query('userId') userId: string) {
     return this.chatService.getUserSessions(userId);
+  }
+
+  @ApiOperation({ summary: 'Get chat session history for a user, sorted by createdAt desc' })
+  @Get('history')
+  async getSessionHistoryList(@Req() req: Request & { user: any }) {
+    const userId = req.user.id;
+    return this.chatService.getUserSessionHistory(userId);
   }
 
   @ApiOperation({ summary: 'Get the conversation history of a session' })

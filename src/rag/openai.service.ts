@@ -174,6 +174,25 @@ export class OpenaiService {
     }
   }
 
+  async openRouterChat(messages: ChatCompletionRequestMessage[], temperature = 0.2): Promise<string> {
+    try {
+      const res = await axios.post(
+        this.OPENROUTER_URL,
+        {
+          model: this.OPENROUTER_MODEL,
+          messages,
+          temperature,
+          max_tokens: this.OPENROUTER_MAX_TOKENS,
+        },
+        { headers: this.openRouterHeaders },
+      );
+      return res.data?.choices?.[0]?.message?.content || '';
+    } catch (error: any) {
+      console.error('OpenRouter chat error:', error?.response?.data || error?.message);
+      return '';
+    }
+  }
+
   // ---- One tool-calling turn (OpenRouter) — returns the assistant message (may hold tool_calls) ----
   async openRouterToolTurn(messages: any[], tools: any[]): Promise<any> {
     const res = await axios.post(

@@ -25,9 +25,7 @@ import { SYSTEM_PROMPT, COLLECTION } from './constants';
 import { ChatService } from '../chat/chat.service';
 import axios from 'axios';
 import { ConfigService } from '@nestjs/config';
-import { ChatGoogleGenerativeAI } from '@langchain/google-genai';
 import { ApiEpUser } from 'src/core/interfaces/user.interface';
-import moment from 'moment';
 import { RedisService } from 'src/core/global/redis.service';
 import { randomUUID } from 'crypto';
 
@@ -59,6 +57,8 @@ export interface AgentGraphResult {
 }
 
 type Route = 'analytics' | 'lookup' | 'search' | 'schedule';
+const DAILY_RAG_LIMIT = 30;
+const DAILY_RAG_WARNING_THRESHOLD = Math.ceil(DAILY_RAG_LIMIT * 0.9);
 
 // Graph state. Kept at module scope so `GraphState` can be referenced in node
 // signatures without polymorphic-`this` type gymnastics.
@@ -80,8 +80,6 @@ type GraphState = typeof GraphState.State;
 export class AgentGraphService {
   private readonly graph: ReturnType<AgentGraphService['buildGraph']>;
   private readonly OPEN_ROUTER_API_KEY: string;
-  private readonly model: ChatGoogleGenerativeAI;
-  private readonly GEMINI_API_KEY: string;
 
   constructor(
     private readonly openai: OpenaiService,
@@ -94,18 +92,37 @@ export class AgentGraphService {
     private readonly chatService: ChatService,
     private readonly configService: ConfigService,
     private readonly redisService: RedisService,
-    
+
   ) {
+    this.OPEN_ROUTER_API_KEY =
+      this.configService.get('OPEN_ROUTER_API_KEY') || this.configService.get('OPEN_ROUTER_KEY') || '';
     this.graph = this.buildGraph();
-    this.OPEN_ROUTER_API_KEY = this.configService.get('OPEN_ROUTER_KEY') || '';
-    this.model = new ChatGoogleGenerativeAI({
-      model: 'gemini-2.5-flash',
-      apiKey: this.GEMINI_API_KEY,
-      // temperature: 0.7,
-      temperature: 0.2,
-      maxOutputTokens: 2048,
+  }
+
+  private messageContentToString(content: BaseMessage['content']): string {
+    if (typeof content === 'string') return content;
+    return content
+      .map((item) => {
+        if (typeof item === 'string') return item;
+        if (item && typeof item === 'object' && 'text' in item) return String(item.text);
+        return '';
+      })
+      .join(' ');
+  }
+
+  private async invokeOpenRouter(messages: BaseMessage[], temperature = 0.2): Promise<AIMessage> {
+    const openRouterMessages = messages.map((message) => {
+      const type = message.getType();
+      const role = type === 'system' ? 'system' : type === 'ai' ? 'assistant' : 'user';
+
+      return {
+        role,
+        content: this.messageContentToString(message.content),
+      };
     });
-    this.GEMINI_API_KEY = this.configService.get('GEMINI_API_KEY') || '';
+
+    const content = await this.openai.openRouterChat(openRouterMessages as any, temperature);
+    return new AIMessage(content);
   }
 
   // ============ Public API ============
@@ -117,11 +134,12 @@ export class AgentGraphService {
     sessionId?: string;
     history?: Array<{ role: string; content: string }>;
     userName?: string;
+    by?: ApiEpUser;
   }): Promise<AgentGraphResult> {
     const isExistingSession = !!params.sessionId;
     let activeSessionId = params.sessionId;
     if (!activeSessionId) {
-      const session = await this.chatService.createSession(params.customerId, params.question);
+      const session = await this.chatService.createSession(params.by?.id, params.question);
       activeSessionId = (session as any)._id.toString();
     }
 
@@ -138,8 +156,7 @@ export class AgentGraphService {
       if (stored.length) history = stored;
     }
 
-    // Persist the user message but DON'T block the response on the DB write.
-    this.chatService.addMessage(activeSessionId, 'user', params.question).catch(() => {});
+    await this.chatService.addMessage(activeSessionId, 'user', params.question);
 
     let answer: string;
     let route = 'smalltalk';
@@ -164,8 +181,7 @@ export class AgentGraphService {
       cached = !!final.cached;
     }
 
-    // Persist the assistant answer without blocking either.
-    this.chatService.addMessage(activeSessionId, 'assistant', answer).catch(() => {});
+    await this.chatService.addMessage(activeSessionId, 'assistant', answer);
 
     return { answer, route, trace, cached, sessionId: activeSessionId };
   }
@@ -239,37 +255,44 @@ export class AgentGraphService {
     history?: Array<{ role: string; content: string }>;
     userName?: string;
     res: Response;
-    by: ApiEpUser;
+    by?: ApiEpUser;
     onAnswer?: (answer: string) => void;
   }): Promise<void> {
     const { res, onAnswer, by } = params;
-
-    if (!by?.epEmailId) {
-      throw new BadRequestException('Not valid WB user');
-    }
-
-    // Acquire lock
-    const { lockKey, lockValue } = await this.acquireUserLock(by.epEmailId);
+    const limiterId = by?.epEmailId;
+    let lockKey: string | undefined;
+    let lockValue: string | undefined;
 
     try {
-      const today = moment().utcOffset('+05:30').format('YYYY-MM-DD');
-      const key = `RAG_HITS:${by.epEmailId}:${today}`;
+      if (limiterId) {
+        const lock = await this.acquireUserLock(limiterId);
+        lockKey = lock.lockKey;
+        lockValue = lock.lockValue;
 
-      const hits = Number((await this.redisService.get(key)) ?? 0);
+        const today = new Date(Date.now() + 330 * 60 * 1000).toISOString().slice(0, 10);
+        const key = `RAG_HITS:${limiterId}:${today}`;
+        const hits = Number((await this.redisService.get(key)) ?? 0);
 
-      if (hits >= 30) {
-        throw new BadRequestException(
-          'Daily RAG limit exceeded (30 hits/day).',
-        );
+        if (hits >= DAILY_RAG_LIMIT) {
+          throw new BadRequestException(
+            `Daily RAG limit exceeded (${DAILY_RAG_LIMIT} hits/day).`,
+          );
+        }
+
+        const newHits = await this.redisService.incr(key);
+
+        if (newHits === 1) {
+          await this.redisService.expire(key, 25 * 60 * 60);
+        }
+
+        if (newHits >= DAILY_RAG_WARNING_THRESHOLD) {
+          res.setHeader('x-rag-limit-warning', '90');
+          res.setHeader('x-rag-limit-used', String(newHits));
+          res.setHeader('x-rag-limit-total', String(DAILY_RAG_LIMIT));
+        }
       }
 
-      const { answer, sessionId } = await this.run(params);
-
-      const newHits = await this.redisService.incr(key);
-
-      if (newHits === 1) {
-        await this.redisService.expire(key, 25 * 60 * 60);
-      }
+      const { answer, sessionId, cached } = await this.run(params);
 
       onAnswer?.(answer);
 
@@ -280,6 +303,14 @@ export class AgentGraphService {
       res.setHeader('Content-Type', 'text/plain; charset=utf-8');
       res.setHeader('Cache-Control', 'no-cache');
       res.flushHeaders?.();
+
+      if (cached) {
+        res.write(answer);
+        if (!res.writableEnded) {
+          res.end();
+        }
+        return;
+      }
 
       const tokens = answer.split(/(\s+)/);
 
@@ -296,7 +327,9 @@ export class AgentGraphService {
         res.end();
       }
     } finally {
-      await this.releaseUserLock(lockKey, lockValue);
+      if (lockKey && lockValue) {
+        await this.releaseUserLock(lockKey, lockValue);
+      }
     }
   }
 
@@ -2732,7 +2765,7 @@ Question: "${question}"`,
         };
       }
 
-      const response = await this.model.invoke([
+      const response = await this.invokeOpenRouter([
         new SystemMessage(`You are a routing classifier. Read the user's question and pick EXACTLY ONE route.
 
         ROUTES:
@@ -2812,7 +2845,7 @@ Question: "${question}"`,
           ? "\nThe user asked multiple questions in one prompt. Answer each sub-question separately and clearly. If any part cannot be answered from the context, say that explicitly rather than guessing."
           : "";
 
-        const response = await this.model.invoke([
+        const response = await this.invokeOpenRouter([
           new SystemMessage(`${getSystemPrompt("rag")}${compoundInstruction}
  
           CONTEXT:
@@ -2848,7 +2881,7 @@ Question: "${question}"`,
           ? "\nThe user asked multiple questions in one prompt. Answer each sub-question separately and clearly. If any part cannot be answered from the context, say that explicitly rather than guessing."
           : "";
 
-        const response = await this.model.invoke([
+        const response = await this.invokeOpenRouter([
           new SystemMessage(`${getSystemPrompt("summary")}${compoundInstruction}
  
           CONTEXT:
@@ -2881,7 +2914,7 @@ Question: "${question}"`,
           ? "\nThe user asked multiple questions in one prompt. Answer each sub-question separately and clearly. If any part cannot be answered from the context, say that explicitly rather than guessing."
           : "";
 
-        const response = await this.model.invoke([
+        const response = await this.invokeOpenRouter([
           new SystemMessage(`${getSystemPrompt("cost_analysis")}${compoundInstruction}
  
           CONTEXT:
@@ -2914,7 +2947,7 @@ Question: "${question}"`,
           ? "\nThe user asked multiple questions in one prompt. Answer each sub-question separately and clearly. If any part cannot be answered from the context, say that explicitly rather than guessing."
           : "";
 
-        const response = await this.model.invoke([
+        const response = await this.invokeOpenRouter([
           new SystemMessage(`${getSystemPrompt("flow_analysis")}${compoundInstruction}
  
           CONTEXT:
@@ -2947,7 +2980,7 @@ Question: "${question}"`,
           ? "\nThe user asked multiple questions in one prompt. Answer each sub-question separately and clearly. If any part cannot be answered from the context, say that explicitly rather than guessing."
           : "";
 
-        const response = await this.model.invoke([
+        const response = await this.invokeOpenRouter([
           new SystemMessage(`${getSystemPrompt("zone_analysis")}${compoundInstruction}
  
           CONTEXT:
@@ -2984,7 +3017,7 @@ Question: "${question}"`,
           ? "\nThe user asked multiple questions in one prompt. Answer each sub-question separately and clearly. If any part cannot be answered from the context, say that explicitly rather than guessing."
           : "";
 
-        const response = await this.model.invoke([
+        const response = await this.invokeOpenRouter([
           new SystemMessage(`${getSystemPrompt("aggregation")}${compoundInstruction}
  
           CONTEXT:

@@ -2,11 +2,11 @@ import {
   Controller, Post, Body, Param, Get, Res, Patch,
   BadRequestException, InternalServerErrorException,
   UseInterceptors, UploadedFile,
-  UseGuards,
+  UseGuards, Req,
 } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
-import { ApiOperation, ApiProduces, ApiResponse, ApiTags } from '@nestjs/swagger';
-import { Response } from 'express';
+import { ApiBearerAuth, ApiOperation, ApiProduces, ApiResponse, ApiTags } from '@nestjs/swagger';
+import { Request, Response } from 'express';
 import { ChatDto, IngestVectorDataDto, PlannerDto } from './dto/rag.dto';
 import { AddSchemaIndexDto, Point } from './dto/qdrant.dto';
 import { ChatCompletionRequestMessage } from './dto/openai.dto';
@@ -30,6 +30,7 @@ import { ApiBy } from 'src/core/decorators/api-user.decorator';
 import moment from 'moment';
 
 @ApiTags('RAG')
+@ApiBearerAuth()
 @UseGuards(WbGuard)
 @Controller('rag')
 export class RagController {
@@ -207,7 +208,7 @@ export class RagController {
           'Daily RAG limit exceeded (30 hits/day).',
         );
       }
-      
+
       const res = await this.agentGraphService.run({
         question: body.question,
         customerId: body.customerId,
@@ -231,7 +232,7 @@ export class RagController {
   @ApiOperation({ summary: 'Agent graph (streaming) — same LangGraph multi-agent flow, streams the final answer as plain text.' })
   @ApiProduces('text/event-stream')
   @Post('agent-graph/stream')
-  async agentGraphStream(@Body() body: PlannerDto, @Res() res: Response, @ApiBy() by: ApiEpUser) {
+  async agentGraphStream(@Body() body: PlannerDto, @Res() res: Response, @Req() req: Request & { user?: any }) {
     if (!body?.customerId) throw new BadRequestException('customerId is required');
     try {
       await this.agentGraphService.runStream({
@@ -241,7 +242,7 @@ export class RagController {
         history: body.history,
         userName: body.userName,
         res,
-        by
+        by: req.user,
       });
     } catch (err) {
       console.error(err);
@@ -314,7 +315,10 @@ export class RagController {
           },
           { role: 'user', content: question },
         ];
-        await this.streamAnswer(messages, res);
+        const streamRes = (await this.streamAnswer(messages, res)) as any;
+        if (streamRes?.result) {
+          this.semanticCache.save(question, cache.embedding, streamRes.result, customerId).catch(() => { });
+        }
         return;
       }
 
@@ -442,7 +446,10 @@ export class RagController {
         },
         { role: 'user', content: question },
       ];
-      await this.streamAnswer(messages, res);
+      const streamRes = (await this.streamAnswer(messages, res)) as any;
+      if (streamRes?.result) {
+        this.semanticCache.save(question, cache.embedding, streamRes.result, customerId).catch(() => { });
+      }
     } catch (err) {
       console.error(err);
       if (!res.headersSent) {
@@ -461,9 +468,9 @@ export class RagController {
   private async streamAnswer(messages: ChatCompletionRequestMessage[], res: Response) {
     if (this.claudeService.isConfigured) {
       const handled = await this.claudeService.streamClaude(messages, res);
-      if (handled) return;
+      if (handled) return { result: '' };
     }
-    await this.openaiService.streamOpenRouter(messages, res);
+    return await this.openaiService.streamOpenRouter(messages, res);
   }
 
   // Extract a numeric condition tied to a field, e.g. "area more than 5000",

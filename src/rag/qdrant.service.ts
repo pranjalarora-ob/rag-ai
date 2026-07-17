@@ -1,6 +1,5 @@
 import { Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { QdrantClient } from '@qdrant/js-client-rest';
 import axios from 'axios';
 import { v5 as uuidV5 } from 'uuid';
 import { AddSchemaIndexDto, Point, SearchQdrantDto } from './dto/qdrant.dto';
@@ -9,13 +8,18 @@ import { AddSchemaIndexDto, Point, SearchQdrantDto } from './dto/qdrant.dto';
 export class QdrantService {
   private QDRANT_URL: string;
   private QDRANT_API_KEY: string;
-  private client: QdrantClient;
   EMBEDDING_DIM = 1536; // openai/text-embedding-3-small
 
   constructor(private readonly configService: ConfigService) {
-    this.QDRANT_URL = this.configService.get('QDRANT_URL') || 'http://localhost:6333';
+    this.QDRANT_URL = (this.configService.get('QDRANT_URL') || 'http://localhost:6333').replace(/\/+$/, '');
     this.QDRANT_API_KEY = this.configService.get('QDRANT_API_KEY') || '';
-    this.client = new QdrantClient({ url: this.QDRANT_URL, apiKey: this.QDRANT_API_KEY, checkCompatibility: false });
+  }
+
+  private get requestConfig() {
+    return {
+      adapter: 'http' as const,
+      headers: this.QDRANT_API_KEY ? { 'api-key': this.QDRANT_API_KEY } : {},
+    };
   }
 
   generateChunkId(originalId: string, chunkIndex: number) {
@@ -24,12 +28,20 @@ export class QdrantService {
   }
 
   async createCollection(collection: string) {
-    const collections = await this.client.getCollections();
-    const exists = collections.collections.some((c) => c.name === collection);
+    const collections = await axios.get(`${this.QDRANT_URL}/collections`, this.requestConfig);
+    const exists = collections.data?.result?.collections?.some((c: any) => c.name === collection);
     if (!exists) {
-      return this.client.createCollection(collection, {
-        vectors: { size: this.EMBEDDING_DIM, distance: 'Cosine' },
-      });
+      try {
+        const res = await axios.put(
+          `${this.QDRANT_URL}/collections/${collection}`,
+          { vectors: { size: this.EMBEDDING_DIM, distance: 'Cosine' } },
+          this.requestConfig,
+        );
+        return res.data?.result ?? res.data;
+      } catch (error: any) {
+        if (error?.response?.status === 409) return false;
+        throw error;
+      }
     }
     return false;
   }
@@ -67,7 +79,12 @@ export class QdrantService {
   async upsert(collection: string, points: Point[]) {
     await this.createCollection(collection);
     try {
-      return await this.client.upsert(collection, { points });
+      const res = await axios.put(
+        `${this.QDRANT_URL}/collections/${collection}/points?wait=true`,
+        { points },
+        this.requestConfig,
+      );
+      return res.data?.result ?? res.data;
     } catch (error) {
       console.error('Qdrant upsert error:', error);
       throw error;
@@ -76,10 +93,19 @@ export class QdrantService {
 
   async search(collection: string, options: SearchQdrantDto) {
     try {
-      return await this.client.search(collection, options);
+      const res = await axios.post(
+        `${this.QDRANT_URL}/collections/${collection}/points/search`,
+        options,
+        this.requestConfig,
+      );
+      return res.data?.result ?? [];
     } catch (error: any) {
       // A collection that doesn't exist yet returns 404 — treat as no results.
-      if (error?.status === 404 || /not found|doesn't exist/i.test(error?.message || '')) {
+      if (
+        error?.response?.status === 404 ||
+        error?.status === 404 ||
+        /not found|doesn't exist/i.test(error?.response?.data?.status?.error || error?.message || '')
+      ) {
         return [];
       }
       throw error;
@@ -92,23 +118,28 @@ export class QdrantService {
     let offset: any = undefined;
     try {
       do {
-        const res = await this.client.scroll(collection, {
-          filter,
-          limit: pageSize,
-          offset,
-          with_payload: true,
-          with_vector: false,
-        });
-        points.push(...res.points);
-        offset = res.next_page_offset;
+        const res = await axios.post(
+          `${this.QDRANT_URL}/collections/${collection}/points/scroll`,
+          {
+            filter,
+            limit: pageSize,
+            offset,
+            with_payload: true,
+            with_vector: false,
+          },
+          this.requestConfig,
+        );
+        const result = res.data?.result;
+        points.push(...(result?.points ?? []));
+        offset = result?.next_page_offset;
       } while (offset !== null && offset !== undefined);
     } catch (error: any) {
       console.error('Qdrant scrollAll error details:', {
-        status: error?.status,
-        message: error?.message,
-        data: error?.data,
+        status: error?.response?.status || error?.status,
+        message: error?.response?.statusText || error?.message,
+        data: error?.response?.data || error?.data,
       });
-      if (error?.status === 404) return [];
+      if (error?.response?.status === 404 || error?.status === 404) return [];
       throw error;
     }
     return points;
@@ -123,7 +154,7 @@ export class QdrantService {
           field_name: addSchemaIndexDto.field,
           field_schema: addSchemaIndexDto.schema,
         },
-        { headers: this.QDRANT_API_KEY ? { 'api-key': this.QDRANT_API_KEY } : {} },
+        this.requestConfig,
       );
       return res.data;
     } catch (error: any) {
@@ -136,11 +167,29 @@ export class QdrantService {
     }
   }
 
+  async deletePoints(collection: string, filter: any) {
+    try {
+      const res = await axios.post(
+        `${this.QDRANT_URL}/collections/${collection}/points/delete?wait=true`,
+        { filter },
+        this.requestConfig,
+      );
+      return res.data;
+    } catch (error: any) {
+      console.error('Qdrant deletePoints error details:', {
+        status: error?.response?.status || error?.status,
+        message: error?.response?.statusText || error?.message,
+        data: error?.response?.data || error?.data,
+      });
+      throw error;
+    }
+  }
+
   async clearCollection(collection: string) {
     const res = await axios.post(
       `${this.QDRANT_URL}/collections/${collection}/points/delete?wait=true`,
       { filter: {} },
-      { headers: this.QDRANT_API_KEY ? { 'api-key': this.QDRANT_API_KEY } : {} },
+      this.requestConfig,
     );
     return res.data;
   }
