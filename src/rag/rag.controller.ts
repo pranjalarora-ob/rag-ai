@@ -37,7 +37,7 @@ export class RagController {
   constructor(
     private readonly qdrantService: QdrantService,
     private readonly openaiService: OpenaiService,
-    private readonly claudeService: ClaudeService,
+    private readonly claude: ClaudeService,
     private readonly guardrailService: GuardrailService,
     private readonly projectAnalyticsService: ProjectAnalyticsService,
     private readonly plannerService: PlannerService,
@@ -461,16 +461,12 @@ export class RagController {
 
   // ============ Helpers ============
 
-  // Stream the answer via Claude when it's configured, otherwise OpenRouter.
-  // If Claude is configured but the upstream call fails before any bytes are
-  // sent (bad key, retired model, network), fall back to OpenRouter so the
-  // request still succeeds instead of dying with a broken empty response.
+  // Stream the answer via Claude. If Claude fails before any bytes are sent, throw
+  // so the caller can still respond with a proper error status.
   private async streamAnswer(messages: ChatCompletionRequestMessage[], res: Response) {
-    if (this.claudeService.isConfigured) {
-      const handled = await this.claudeService.streamClaude(messages, res);
-      if (handled) return { result: '' };
-    }
-    return await this.openaiService.streamOpenRouter(messages, res);
+    const result = await this.claude.stream(messages, res);
+    if (result === null) throw new InternalServerErrorException('LLM call failed');
+    return { result };
   }
 
   // Extract a numeric condition tied to a field, e.g. "area more than 5000",
@@ -643,13 +639,7 @@ Examples:
 Question: "${question}"`;
 
     try {
-      // Prefer Claude, but fall back to OpenRouter if it's not configured or the
-      // call fails (claudeGenerate returns '' on error) — otherwise every query
-      // would silently default to 'rag' whenever Claude is down.
-      let raw = this.claudeService.isConfigured
-        ? await this.claudeService.claudeGenerate(prompt)
-        : '';
-      if (!raw) raw = await this.openaiService.openRouterGenerate(prompt);
+      const raw = await this.claude.generate(prompt, { effort: 'low' });
       const json = raw.replace(/```json|```/g, '').trim();
       const parsed = JSON.parse(json);
       if (parsed?.type === 'analytics' || parsed?.type === 'rag') return parsed;

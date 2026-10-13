@@ -1,6 +1,7 @@
 import { Injectable } from '@nestjs/common';
 import { Response } from 'express';
 import { OpenaiService } from './openai.service';
+import { ClaudeService } from './claude.service';
 import { QdrantService } from './qdrant.service';
 import { ProjectAnalyticsService } from './project-analytics.service';
 import { ProjectFlowService } from './project-flow.service';
@@ -59,6 +60,7 @@ export class PlannerService {
     private readonly projectAnalyticsService: ProjectAnalyticsService,
     private readonly projectFlowService: ProjectFlowService,
     private readonly rerankService: RerankService,
+    private readonly claude: ClaudeService,
   ) { }
 
   private readonly tools = [
@@ -218,7 +220,7 @@ Rules:
     const trace: PlannerResult['trace'] = [];
 
     for (let step = 1; step <= MAX_STEPS; step++) {
-      const assistant = await this.openaiService.openRouterToolTurn(messages, this.tools);
+      const assistant = await this.claude.toolTurn(messages, this.tools);
       const toolCalls = assistant?.tool_calls;
 
       if (!toolCalls || toolCalls.length === 0) {

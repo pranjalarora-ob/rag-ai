@@ -15,6 +15,7 @@ import {
   BaseMessage
 } from '@langchain/core/messages';
 import { OpenaiService } from './openai.service';
+import { ClaudeService } from './claude.service';
 import { QdrantService } from './qdrant.service';
 import { RerankService } from './rerank.service';
 import { GuardrailService } from './guardrail.service';
@@ -92,6 +93,7 @@ export class AgentGraphService {
     private readonly chatService: ChatService,
     private readonly configService: ConfigService,
     private readonly redisService: RedisService,
+    private readonly claude: ClaudeService,
 
   ) {
     this.OPEN_ROUTER_API_KEY =
@@ -110,8 +112,8 @@ export class AgentGraphService {
       .join(' ');
   }
 
-  private async invokeOpenRouter(messages: BaseMessage[], temperature = 0.2): Promise<AIMessage> {
-    const openRouterMessages = messages.map((message) => {
+  private async invokeLlm(messages: BaseMessage[]): Promise<AIMessage> {
+    const chatMessages = messages.map((message) => {
       const type = message.getType();
       const role = type === 'system' ? 'system' : type === 'ai' ? 'assistant' : 'user';
 
@@ -121,7 +123,7 @@ export class AgentGraphService {
       };
     });
 
-    const content = await this.openai.openRouterChat(openRouterMessages as any, temperature);
+    const content = await this.claude.chat(chatMessages as any);
     return new AIMessage(content);
   }
 
@@ -466,7 +468,7 @@ export class AgentGraphService {
     }
 
     if (singleRecord) {
-      const focused = await this.openai.openRouterGenerate(
+      const focused = await this.claude.generate(
         `${SYSTEM_PROMPT}
 
 Answer the user's question CONCISELY using ONLY the exact project record below.
@@ -476,7 +478,6 @@ RECORD:
 ${r.answer}
 
 QUESTION: ${state.question}`,
-        0,
       );
       if (focused?.trim()) return { answer: focused.trim(), trace: r.trace };
     }
@@ -506,7 +507,7 @@ QUESTION: ${state.question}`,
     }
 
     const context = reranked.join('\n\n---\n\n');
-    const answer = await this.openai.openRouterGenerate(
+    const answer = await this.claude.generate(
       `${SYSTEM_PROMPT}
 
 Answer the user's question using ONLY the project context below. Be concise.
@@ -515,7 +516,6 @@ CONTEXT:
 ${context}
 
 QUESTION: ${state.question}`,
-      0.2,
     );
 
     return {
@@ -713,7 +713,7 @@ QUESTION: ${state.question}`,
     const aggregate = /\b(total|sum|average|avg|count|how many|highest|lowest|top\s*\d+|rank|most|least|combined|per\s+\w+|group)\b/.test(q);
 
     const raw = (
-      await this.openai.openRouterGenerate(
+      await this.claude.generate(
         `Classify the question into ONE route word: analytics, lookup, or search.
 - analytics: totals, sums, averages, counts, "how many", top-N rankings, group-by, charts/comparisons across many projects.
 - lookup: exact filtered list or count by a specific field (city, owner, zone, area, estimated value, project code, lead vs project).
@@ -721,7 +721,7 @@ QUESTION: ${state.question}`,
 Return ONLY the single route word, nothing else.
 
 Question: "${question}"`,
-        0,
+        { effort: 'low' },
       )
     )
       .trim()
@@ -2765,7 +2765,7 @@ Question: "${question}"`,
         };
       }
 
-      const response = await this.invokeOpenRouter([
+      const response = await this.invokeLlm([
         new SystemMessage(`You are a routing classifier. Read the user's question and pick EXACTLY ONE route.
 
         ROUTES:
@@ -2845,7 +2845,7 @@ Question: "${question}"`,
           ? "\nThe user asked multiple questions in one prompt. Answer each sub-question separately and clearly. If any part cannot be answered from the context, say that explicitly rather than guessing."
           : "";
 
-        const response = await this.invokeOpenRouter([
+        const response = await this.invokeLlm([
           new SystemMessage(`${getSystemPrompt("rag")}${compoundInstruction}
  
           CONTEXT:
@@ -2881,7 +2881,7 @@ Question: "${question}"`,
           ? "\nThe user asked multiple questions in one prompt. Answer each sub-question separately and clearly. If any part cannot be answered from the context, say that explicitly rather than guessing."
           : "";
 
-        const response = await this.invokeOpenRouter([
+        const response = await this.invokeLlm([
           new SystemMessage(`${getSystemPrompt("summary")}${compoundInstruction}
  
           CONTEXT:
@@ -2914,7 +2914,7 @@ Question: "${question}"`,
           ? "\nThe user asked multiple questions in one prompt. Answer each sub-question separately and clearly. If any part cannot be answered from the context, say that explicitly rather than guessing."
           : "";
 
-        const response = await this.invokeOpenRouter([
+        const response = await this.invokeLlm([
           new SystemMessage(`${getSystemPrompt("cost_analysis")}${compoundInstruction}
  
           CONTEXT:
@@ -2947,7 +2947,7 @@ Question: "${question}"`,
           ? "\nThe user asked multiple questions in one prompt. Answer each sub-question separately and clearly. If any part cannot be answered from the context, say that explicitly rather than guessing."
           : "";
 
-        const response = await this.invokeOpenRouter([
+        const response = await this.invokeLlm([
           new SystemMessage(`${getSystemPrompt("flow_analysis")}${compoundInstruction}
  
           CONTEXT:
@@ -2980,7 +2980,7 @@ Question: "${question}"`,
           ? "\nThe user asked multiple questions in one prompt. Answer each sub-question separately and clearly. If any part cannot be answered from the context, say that explicitly rather than guessing."
           : "";
 
-        const response = await this.invokeOpenRouter([
+        const response = await this.invokeLlm([
           new SystemMessage(`${getSystemPrompt("zone_analysis")}${compoundInstruction}
  
           CONTEXT:
@@ -3017,7 +3017,7 @@ Question: "${question}"`,
           ? "\nThe user asked multiple questions in one prompt. Answer each sub-question separately and clearly. If any part cannot be answered from the context, say that explicitly rather than guessing."
           : "";
 
-        const response = await this.invokeOpenRouter([
+        const response = await this.invokeLlm([
           new SystemMessage(`${getSystemPrompt("aggregation")}${compoundInstruction}
  
           CONTEXT:

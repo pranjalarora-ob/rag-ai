@@ -19,7 +19,7 @@ export interface AgentResult {
 
 /**
  * The AGENT: turns a natural-language question into a STRUCTURED query and runs it
- * deterministically. The LLM (Claude if configured, else OpenRouter) only fills the
+ * deterministically. The LLM (Claude) only fills the
  * `queryProjects` tool's arguments — all filtering/sorting/counting is done in code,
  * so results are exact (no truncation, no invented numbers). `searchProjects` handles
  * descriptive/semantic lookups about a specific project.
@@ -116,9 +116,7 @@ You are a project assistant. Use a tool to answer — never invent numbers or li
     const trace: AgentResult['trace'] = [];
 
     for (let step = 1; step <= MAX_STEPS; step++) {
-      const assistant = this.claude.isConfigured
-        ? await this.claude.claudeToolTurn(messages, this.tools)
-        : await this.openai.openRouterToolTurn(messages, this.tools);
+      const assistant = await this.claude.toolTurn(messages, this.tools);
 
       const toolCalls = assistant?.tool_calls;
       if (!toolCalls || toolCalls.length === 0) {

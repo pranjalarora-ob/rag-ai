@@ -9,6 +9,7 @@
     "start:prod": "node dist/main"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.133.0",
     "@aws-sdk/client-secrets-manager": "^3.1088.0",
     "@aws-sdk/rds-signer": "^3.1068.0",
     "@langchain/core": "^1.2.1",
